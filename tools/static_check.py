@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dependency-free static checks for IME Caret 1.5."""
+"""Dependency-free static checks for IME Caret 1.6."""
 
 from __future__ import annotations
 
@@ -121,9 +121,9 @@ def main() -> None:
 
     cargo = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
     assert cargo["package"]["name"] == "ime-caret"
-    assert cargo["package"]["version"] == "1.5.0"
+    assert cargo["package"]["version"] == "1.6.0"
     assert 'name = "ime-caret"' in (ROOT / "Cargo.lock").read_text(encoding="utf-8")
-    assert 'version = "1.5.0"' in (ROOT / "Cargo.lock").read_text(encoding="utf-8")
+    assert 'version = "1.6.0"' in (ROOT / "Cargo.lock").read_text(encoding="utf-8")
     assert "active editable text caret" in cargo["package"]["description"]
 
     main_rs = (SRC / "main.rs").read_text(encoding="utf-8")
@@ -136,7 +136,7 @@ def main() -> None:
     all_source = "\n".join([main_rs, ime_rs, editability_rs, outlook_rs, config_rs, win_rs, assets_rs])
 
     assert 'const APP_NAME: &str = "IME Caret";' in main_rs
-    assert 'const APP_VERSION: &str = "1.5";' in main_rs
+    assert 'const APP_VERSION: &str = "1.6";' in main_rs
     assert "tray_tooltip_text()" in main_rs
     assert 'PathBuf::from("IME Caret.exe")' in main_rs
     assert 'exe_dir.join("IMECaret.ini")' in main_rs
@@ -422,7 +422,7 @@ def main() -> None:
             assert audio.getframerate() == 22050
             assert audio.getnframes() > 0
 
-    print("IME Caret 1.5 static checks passed")
+    print("IME Caret 1.6 static checks passed")
 
 
 if __name__ == "__main__":

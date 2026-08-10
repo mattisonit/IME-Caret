@@ -90,7 +90,6 @@ const CHILDID_SELF: i32 = 0;
 // bodies. A standalone viewer marks its containing _WwB window with these
 // style bits, while the main-window Reading Pane embeds its first
 // rctrl_renwnd32 host as a child window.
-const OFFICE_WORD_READER_PARENT_STYLE: u32 = 0x000b_0000;
 const MAX_OFFICE_WORD_HOST_PARENT_DEPTH: usize = 8;
 const MAX_ACCESSIBLE_CARET_WIDTH: i32 = 8;
 const MAX_ACCESSIBLE_CARET_HEIGHT: i32 = 256;
@@ -361,6 +360,7 @@ impl EditabilityDetector {
         let classic_console = is_classic_console_window(targets.foreground);
         let foreground_class = window_class_name(targets.foreground).unwrap_or_default();
         let uia_preferred = is_uia_preferred_caret_class(&foreground_class);
+        let office_uia_preferred = is_office_uia_preferred_caret_class(&foreground_class);
         let force_exact_uia_geometry = uia_preferred && is_chromium_widget_class(&foreground_class);
         if !classic_console {
             self.detach_console();
@@ -426,29 +426,52 @@ impl EditabilityDetector {
         // publishes only an Active Accessibility caret. Office publishes that
         // accessibility caret as a short-lived object, so acquire it for each
         // position query but never probe the same window twice per refresh.
-        let mut saw_office_word_editor = false;
+        let mut saw_outlook_word_editor = false;
         let mut last_office_window = null_mut();
         for window in [targets.caret, targets.focus] {
             if !window.is_null() && is_office_word_editor_window(window) {
-                saw_office_word_editor = true;
                 if window == last_office_window {
                     continue;
                 }
                 last_office_window = window;
 
-                if matches!(
-                    self.classify_office_word_editor_target(targets, window),
-                    Some(Editability::Editable)
-                ) {
-                    if let Some(anchor) = self.outlook_caret_anchor(targets, window) {
-                        return Some(anchor);
+                if outlook_word_host(window).is_some() {
+                    saw_outlook_word_editor = true;
+                    if matches!(
+                        self.classify_office_word_editor_target(targets, window),
+                        Some(Editability::Editable)
+                    ) {
+                        if let Some(anchor) = self.outlook_caret_anchor(targets, window) {
+                            return Some(anchor);
+                        }
                     }
+                } else if let Some(anchor) = accessible_system_caret_anchor(window)
+                    .filter(|anchor| anchor_matches_window(*anchor, window))
+                {
+                    // Word uses the same _WwG document class as Outlook's
+                    // embedded Word editor. Only the rctrl_renwnd32 ancestry
+                    // identifies Outlook; a normal Word document must retain
+                    // its own accessibility caret and generic fallbacks.
+                    return Some(anchor);
                 }
             }
         }
 
-        if saw_office_word_editor {
+        if saw_outlook_word_editor {
             return None;
+        }
+
+        // PowerPoint can publish a compatibility Win32 caret that
+        // is absent or detached from the visible insertion point. Prefer the
+        // focused UI Automation text range, then the Office accessibility
+        // caret, and do not fall through to stale Win32 geometry.
+        if office_uia_preferred {
+            match self.uia_focused_caret_anchor(targets, false, false) {
+                CaretProbeResult::Found(anchor) => return Some(anchor),
+                CaretProbeResult::Suppress => return None,
+                CaretProbeResult::Missing => {}
+            }
+            return office_accessible_caret_anchor(targets);
         }
 
         if let Some(anchor) = win32_caret_anchor(targets) {
@@ -575,6 +598,29 @@ impl EditabilityDetector {
             return result;
         }
 
+        let foreground_class = window_class_name(targets.foreground).unwrap_or_default();
+        if foreground_class.eq_ignore_ascii_case("OpusApp")
+            && [targets.caret, targets.focus].into_iter().any(|window| {
+                !window.is_null()
+                    && IsWindowEnabled(window) != FALSE
+                    && is_office_word_editor_window(window)
+            })
+        {
+            // A focused _WwG hosted by Word itself is the document editor.
+            // Recognize it directly instead of waiting for Word's UIA tree to
+            // publish its editable state. Outlook is excluded by its distinct
+            // foreground frame and continues through the guarded mail path.
+            let result = Editability::Editable;
+            self.last_focus_probe = Some(CachedFocusProbe {
+                foreground: targets.foreground,
+                focus: targets.focus,
+                caret: targets.caret,
+                result,
+                tick: now,
+            });
+            return result;
+        }
+
         if let Some(cached) = self.last_focus_probe {
             if cached.foreground == targets.foreground
                 && cached.focus == targets.focus
@@ -594,7 +640,7 @@ impl EditabilityDetector {
                 continue;
             }
             if is_office_word_editor_window(window) {
-                if office_word_editability.is_none() {
+                if outlook_word_host(window).is_some() && office_word_editability.is_none() {
                     office_word_editability =
                         self.classify_office_word_editor_target(targets, window);
                 }
@@ -615,6 +661,20 @@ impl EditabilityDetector {
                 Some(Editability::ReadOnly) => saw_read_only = true,
                 _ => {}
             }
+        }
+
+        if is_office_uia_preferred_caret_class(&foreground_class)
+            && office_accessible_caret_anchor(targets).is_some()
+        {
+            let result = Editability::Editable;
+            self.last_focus_probe = Some(CachedFocusProbe {
+                foreground: targets.foreground,
+                focus: targets.focus,
+                caret: targets.caret,
+                result,
+                tick: now,
+            });
+            return result;
         }
 
         let result = match office_word_editability {
@@ -675,7 +735,7 @@ impl EditabilityDetector {
             return Some(result);
         }
 
-        classify_office_word_editor_window(window)
+        None
     }
 
     unsafe fn focused_input_host_unsafe(&mut self) -> FocusedInputHost {
@@ -1197,6 +1257,16 @@ unsafe fn accessible_system_caret_object(window: HWND) -> Option<*mut c_void> {
 }
 
 unsafe fn accessible_caret_anchor_from_object(accessible: *mut c_void) -> Option<CaretAnchor> {
+    let mut child: VARIANT = zeroed();
+    child.vt = VT_I4;
+    child.data.l_val = CHILDID_SELF;
+    accessible_caret_anchor_from_object_child(accessible, child)
+}
+
+unsafe fn accessible_caret_anchor_from_object_child(
+    accessible: *mut c_void,
+    child: VARIANT,
+) -> Option<CaretAnchor> {
     if accessible.is_null() {
         return None;
     }
@@ -1213,9 +1283,6 @@ unsafe fn accessible_caret_anchor_from_object(accessible: *mut c_void) -> Option
     };
     let method: AccLocation = transmute(address);
 
-    let mut child: VARIANT = zeroed();
-    child.vt = VT_I4;
-    child.data.l_val = CHILDID_SELF;
     let mut left = 0;
     let mut top = 0;
     let mut width = 0;
@@ -1479,35 +1546,30 @@ fn is_chromium_widget_class(class_name: &str) -> bool {
         .starts_with("chrome_widgetwin_")
 }
 
-unsafe fn is_office_word_editor_window(window: HWND) -> bool {
-    window_class_name(window).is_some_and(|class_name| is_office_word_editor_class(&class_name))
+fn is_office_uia_preferred_caret_class(class_name: &str) -> bool {
+    class_name.eq_ignore_ascii_case("PPTFrameClass")
 }
 
-unsafe fn classify_office_word_editor_window(window: HWND) -> Option<Editability> {
-    if !is_office_word_editor_window(window) {
-        return None;
+unsafe fn office_accessible_caret_anchor(
+    targets: ForegroundFocusTargets,
+) -> Option<CaretAnchor> {
+    let mut last_window = null_mut();
+    for window in [targets.focus, targets.caret] {
+        if window.is_null() || window == last_window {
+            continue;
+        }
+        last_window = window;
+        if let Some(anchor) = accessible_system_caret_anchor(window)
+            .filter(|anchor| anchor_matches_window(*anchor, window))
+        {
+            return Some(anchor);
+        }
     }
+    None
+}
 
-    let document = GetParent(window);
-    if document.is_null()
-        || !window_class_name(document)
-            .is_some_and(|class_name| class_name.eq_ignore_ascii_case("_WwB"))
-    {
-        return None;
-    }
-
-    let style = get_window_long_ptr(document, GWL_STYLE) as u32;
-    if style & OFFICE_WORD_READER_PARENT_STYLE == OFFICE_WORD_READER_PARENT_STYLE {
-        return Some(Editability::ReadOnly);
-    }
-
-    let host = outlook_word_host(window)?;
-    let host_style = get_window_long_ptr(host, GWL_STYLE) as u32;
-    Some(if host_style & WS_CHILD != 0 {
-        Editability::ReadOnly
-    } else {
-        Editability::Editable
-    })
+unsafe fn is_office_word_editor_window(window: HWND) -> bool {
+    window_class_name(window).is_some_and(|class_name| is_office_word_editor_class(&class_name))
 }
 
 unsafe fn outlook_word_host(window: HWND) -> Option<HWND> {

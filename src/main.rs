@@ -40,7 +40,7 @@ mod windows_app {
     use std::time::{Duration, Instant};
 
     const APP_NAME: &str = "IME Caret";
-    const APP_VERSION: &str = "1.5";
+    const APP_VERSION: &str = "1.6";
     const MAIN_CLASS: &str = "ImeCaret.MainWindow";
     const BADGE_CLASS: &str = "ImeCaret.BadgeWindow";
     const SETTINGS_CLASS: &str = "ImeCaret.SettingsWindow";
@@ -418,10 +418,15 @@ mod windows_app {
                 let caret_event = event_flags
                     & (WIN_EVENT_FLAG_CARET | WIN_EVENT_FLAG_TEXT_SELECTION)
                     != 0;
+                let activation_event = priority_event
+                    || (caret_event
+                        && (!self.badge_visible || self.active_caret_anchor.is_none()));
 
-                if priority_event {
+                if activation_event {
                     self.focus_activation_retries_remaining = FOCUS_ACTIVATION_RETRY_COUNT;
                     self.editability_detector.invalidate_focus_cache();
+                }
+                if priority_event {
                     self.shell_overlay_hwnd = null_mut();
                     self.shell_overlay_active = false;
                     self.shell_focused_host = FocusedInputHost::default();
@@ -449,6 +454,9 @@ mod windows_app {
                     refreshed_ime_state = !self.refresh_caret_position_only();
                 } else if event_refresh_due {
                     self.refresh_from_active_caret();
+                    if activation_event {
+                        self.schedule_focus_activation_retry_if_needed();
+                    }
                     refreshed_ime_state = true;
                 } else if can_refresh_caret_only {
                     self.caret_refresh_pending = true;
@@ -526,6 +534,11 @@ mod windows_app {
                 self.focus_activation_retries_remaining = 0;
             } else if self.focus_activation_retries_remaining > 0 {
                 self.focus_activation_retries_remaining -= 1;
+                // Office may publish its editable element or accessibility
+                // caret shortly after the initial focus/caret notification.
+                // Re-probe on each short activation retry instead of reusing
+                // the transient Unknown result for the whole retry window.
+                self.editability_detector.invalidate_focus_cache();
                 self.full_refresh_pending = true;
             }
         }
@@ -2911,7 +2924,7 @@ mod windows_app {
 
         #[test]
         fn tray_tooltip_contains_program_name_and_version() {
-            assert_eq!(tray_tooltip_text(), "IME Caret 1.5");
+            assert_eq!(tray_tooltip_text(), "IME Caret 1.6");
         }
 
         #[test]
