@@ -34,12 +34,15 @@ pub type HGDIOBJ = *mut c_void;
 pub type HFONT = *mut c_void;
 pub type HKL = *mut c_void;
 pub type HRAWINPUT = *mut c_void;
+pub type DPI_AWARENESS_CONTEXT = HANDLE;
 pub type PCWSTR = *const u16;
 pub type PWSTR = *mut u16;
 pub type SAFEARRAY = c_void;
 
 pub const FALSE: BOOL = 0;
 pub const TRUE: BOOL = 1;
+pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: DPI_AWARENESS_CONTEXT =
+    -4isize as DPI_AWARENESS_CONTEXT;
 
 pub type WNDPROC = Option<unsafe extern "system" fn(HWND, UINT, WPARAM, LPARAM) -> LRESULT>;
 pub type WNDENUMPROC = Option<unsafe extern "system" fn(HWND, LPARAM) -> BOOL>;
@@ -509,6 +512,7 @@ pub const SM_CYSCREEN: i32 = 1;
 
 // Monitor constants.
 pub const MONITOR_DEFAULTTONEAREST: DWORD = 0x0000_0002;
+pub const MDT_EFFECTIVE_DPI: i32 = 0;
 pub const DWMWA_EXTENDED_FRAME_BOUNDS: DWORD = 9;
 
 // HRESULT values.
@@ -687,6 +691,7 @@ extern "system" {
     pub fn GetWindowTextW(hWnd: HWND, lpString: PWSTR, nMaxCount: i32) -> i32;
 
     pub fn MonitorFromPoint(pt: POINT, dwFlags: DWORD) -> HMONITOR;
+    pub fn MonitorFromWindow(hwnd: HWND, dwFlags: DWORD) -> HMONITOR;
     pub fn GetMonitorInfoW(hMonitor: HMONITOR, lpmi: *mut MONITORINFO) -> BOOL;
     pub fn ClientToScreen(hWnd: HWND, lpPoint: *mut POINT) -> BOOL;
     pub fn LoadCursorW(hInstance: HINSTANCE, lpCursorName: PCWSTR) -> HCURSOR;
@@ -757,7 +762,19 @@ extern "system" {
     pub fn GetSystemMetrics(nIndex: i32) -> i32;
     pub fn GetDlgItem(hDlg: HWND, nIDDlgItem: i32) -> HWND;
     pub fn SetWindowTextW(hWnd: HWND, lpString: PCWSTR) -> BOOL;
+    pub fn GetDpiForWindow(hwnd: HWND) -> UINT;
+    pub fn SetProcessDpiAwarenessContext(value: DPI_AWARENESS_CONTEXT) -> BOOL;
     pub fn SetProcessDPIAware() -> BOOL;
+}
+
+#[link(name = "shcore")]
+extern "system" {
+    pub fn GetDpiForMonitor(
+        hmonitor: HMONITOR,
+        dpi_type: i32,
+        dpi_x: *mut UINT,
+        dpi_y: *mut UINT,
+    ) -> HRESULT;
 }
 
 #[link(name = "dwmapi")]
@@ -809,6 +826,22 @@ extern "system" {
 #[link(name = "gdi32")]
 extern "system" {
     pub fn GetStockObject(i: i32) -> HGDIOBJ;
+    pub fn CreateFontW(
+        cHeight: i32,
+        cWidth: i32,
+        cEscapement: i32,
+        cOrientation: i32,
+        cWeight: i32,
+        bItalic: DWORD,
+        bUnderline: DWORD,
+        bStrikeOut: DWORD,
+        iCharSet: DWORD,
+        iOutPrecision: DWORD,
+        iClipPrecision: DWORD,
+        iQuality: DWORD,
+        iPitchAndFamily: DWORD,
+        pszFaceName: PCWSTR,
+    ) -> HFONT;
     pub fn CreateSolidBrush(color: COLORREF) -> HBRUSH;
     pub fn DeleteObject(ho: HGDIOBJ) -> BOOL;
     pub fn SelectObject(hdc: HDC, h: HGDIOBJ) -> HGDIOBJ;

@@ -1496,24 +1496,70 @@ unsafe fn win32_caret_anchor(targets: ForegroundFocusTargets) -> Option<CaretAnc
 
     let rect = targets.caret_rect;
     let caret_width = rect.right.saturating_sub(rect.left).clamp(1, 8);
-    let mut top_right = POINT {
-        x: rect.left.saturating_add(caret_width),
-        y: rect.top,
-    };
-    let mut bottom_right = POINT {
-        x: rect.left.saturating_add(caret_width),
-        y: rect.bottom.max(rect.top.saturating_add(1)),
-    };
-    if ClientToScreen(targets.caret, &mut top_right) == FALSE
-        || ClientToScreen(targets.caret, &mut bottom_right) == FALSE
-    {
+    let mut client_origin = POINT { x: 0, y: 0 };
+    if ClientToScreen(targets.caret, &mut client_origin) == FALSE {
         return None;
     }
+
+    // GetGUIThreadInfo returns rcCaret in the caret window's own logical
+    // coordinate space. ClientToScreen is evaluated in this process's PMv2
+    // coordinate space, so passing rcCaret to it directly makes the horizontal
+    // error grow with every character when a system-DPI-aware window moves to
+    // a monitor with a different scale. Convert client offsets explicitly.
+    let reported_dpi = GetDpiForWindow(targets.caret);
+    let logical_dpi = if reported_dpi == 0 { 96 } else { reported_dpi };
+    let physical_dpi = monitor_dpi_for_window(targets.caret).unwrap_or(logical_dpi);
+    let right = rect.left.saturating_add(caret_width);
+    let bottom = rect.bottom.max(rect.top.saturating_add(1));
+    let top_right = POINT {
+        x: client_origin
+            .x
+            .saturating_add(scale_between_dpi(right, logical_dpi, physical_dpi)),
+        y: client_origin
+            .y
+            .saturating_add(scale_between_dpi(rect.top, logical_dpi, physical_dpi)),
+    };
+    let bottom_right = POINT {
+        x: top_right.x,
+        y: client_origin
+            .y
+            .saturating_add(scale_between_dpi(bottom, logical_dpi, physical_dpi)),
+    };
     Some(CaretAnchor {
         x: top_right.x,
         top: top_right.y,
         bottom: bottom_right.y.max(top_right.y.saturating_add(1)),
     })
+}
+
+unsafe fn monitor_dpi_for_window(window: HWND) -> Option<u32> {
+    let monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+    if monitor.is_null() {
+        return None;
+    }
+
+    let mut dpi_x = 0;
+    let mut dpi_y = 0;
+    if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) == S_OK && dpi_x != 0 {
+        Some(dpi_x)
+    } else {
+        None
+    }
+}
+
+fn scale_between_dpi(value: i32, from_dpi: u32, to_dpi: u32) -> i32 {
+    if from_dpi == 0 || from_dpi == to_dpi {
+        return value;
+    }
+
+    let numerator = i64::from(value) * i64::from(to_dpi);
+    let half = i64::from(from_dpi) / 2;
+    let rounded = if numerator >= 0 {
+        numerator.saturating_add(half)
+    } else {
+        numerator.saturating_sub(half)
+    };
+    (rounded / i64::from(from_dpi)).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
 unsafe fn is_console_like_window(window: HWND) -> bool {

@@ -40,7 +40,7 @@ mod windows_app {
     use std::time::{Duration, Instant};
 
     const APP_NAME: &str = "IME Caret";
-    const APP_VERSION: &str = "1.6";
+    const APP_VERSION: &str = "1.7";
     const MAIN_CLASS: &str = "ImeCaret.MainWindow";
     const BADGE_CLASS: &str = "ImeCaret.BadgeWindow";
     const SETTINGS_CLASS: &str = "ImeCaret.SettingsWindow";
@@ -76,8 +76,10 @@ mod windows_app {
     const UNKNOWN_CLEAR_DELAY: Duration = Duration::from_millis(300);
     const CARET_INDICATOR_WIDTH: i32 = 15;
     const CARET_INDICATOR_HEIGHT: i32 = 15;
+    const CARET_INDICATOR_FONT_HEIGHT: i32 = 11;
     const CARET_INDICATOR_X_GAP: i32 = 4;
     const CARET_INDICATOR_VERTICAL_GAP: i32 = 2;
+    const DEFAULT_DPI: u32 = 96;
     const SHELL_OVERLAY_EDGE_GAP: i32 = 0;
     const CARET_INDICATOR_ALPHA: u8 = 165;
 
@@ -218,6 +220,7 @@ mod windows_app {
         badge_text: Vec<u16>,
         badge_color: COLORREF,
         badge_position: Option<(i32, i32)>,
+        badge_size: Option<(i32, i32)>,
         cleaning_up: bool,
         shell_overlay_hwnd: HWND,
         shell_overlay_active: bool,
@@ -274,6 +277,7 @@ mod windows_app {
                 badge_text: wide_without_null("A"),
                 badge_color: rgb(0x55, 0x55, 0x55),
                 badge_position: None,
+                badge_size: None,
                 cleaning_up: false,
                 shell_overlay_hwnd: null_mut(),
                 shell_overlay_active: false,
@@ -770,24 +774,37 @@ mod windows_app {
                 InvalidateRect(self.badge_hwnd, null(), TRUE);
             }
 
+            let dpi = monitor_dpi_at_point(POINT {
+                x: anchor.x,
+                y: anchor.bottom,
+            })
+            .unwrap_or_else(|| window_dpi(GetForegroundWindow()));
+            let badge_width = scale_for_dpi(CARET_INDICATOR_WIDTH, dpi);
+            let badge_height = scale_for_dpi(CARET_INDICATOR_HEIGHT, dpi);
+
             let (x, y) = caret_indicator_position_avoiding_rect(
                 anchor,
-                CARET_INDICATOR_WIDTH,
-                CARET_INDICATOR_HEIGHT,
+                badge_width,
+                badge_height,
                 self.config.indicator_position,
                 shell_overlay,
             );
-            if !self.badge_visible || self.badge_position != Some((x, y)) {
+            if !self.badge_visible
+                || self.badge_position != Some((x, y))
+                || self.badge_size != Some((badge_width, badge_height))
+            {
                 SetWindowPos(
                     self.badge_hwnd,
                     HWND_TOPMOST,
                     x,
                     y,
-                    CARET_INDICATOR_WIDTH,
-                    CARET_INDICATOR_HEIGHT,
+                    badge_width,
+                    badge_height,
                     SWP_NOACTIVATE | SWP_SHOWWINDOW,
                 );
                 self.badge_position = Some((x, y));
+                self.badge_size = Some((badge_width, badge_height));
+                InvalidateRect(self.badge_hwnd, null(), TRUE);
             }
             self.badge_visible = true;
         }
@@ -1474,7 +1491,9 @@ mod windows_app {
 
     pub fn run() {
         unsafe {
-            SetProcessDPIAware();
+            if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) == FALSE {
+                SetProcessDPIAware();
+            }
 
             let mutex_name = wide(MUTEX_NAME);
             let mutex_handle = CreateMutexW(null(), TRUE, mutex_name.as_ptr());
@@ -1758,7 +1777,28 @@ mod windows_app {
 
                     SetBkMode(dc, TRANSPARENT);
                     SetTextColor(dc, rgb(0xff, 0xff, 0xff));
-                    let font = GetStockObject(DEFAULT_GUI_FONT);
+                    let font_face = wide("Segoe UI");
+                    let created_font = CreateFontW(
+                        -scale_for_dpi(CARET_INDICATOR_FONT_HEIGHT, window_dpi(hwnd)),
+                        0,
+                        0,
+                        0,
+                        400,
+                        FALSE as DWORD,
+                        FALSE as DWORD,
+                        FALSE as DWORD,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        font_face.as_ptr(),
+                    );
+                    let font = if created_font.is_null() {
+                        GetStockObject(DEFAULT_GUI_FONT)
+                    } else {
+                        created_font as HGDIOBJ
+                    };
                     let old_font = if font.is_null() {
                         null_mut()
                     } else {
@@ -1773,6 +1813,9 @@ mod windows_app {
                     );
                     if !old_font.is_null() {
                         SelectObject(dc, old_font);
+                    }
+                    if !created_font.is_null() {
+                        DeleteObject(created_font as HGDIOBJ);
                     }
                 }
                 EndPaint(hwnd, &paint);
@@ -2376,22 +2419,32 @@ mod windows_app {
     ) -> (i32, i32) {
         let max_x = bounds.right.saturating_sub(width);
         let max_y = bounds.bottom.saturating_sub(height);
+        let x_gap = proportional_indicator_metric(
+            CARET_INDICATOR_X_GAP,
+            width,
+            CARET_INDICATOR_WIDTH,
+        );
+        let vertical_gap = proportional_indicator_metric(
+            CARET_INDICATOR_VERTICAL_GAP,
+            height,
+            CARET_INDICATOR_HEIGHT,
+        );
 
         let (mut x, mut y) = match position {
             IndicatorPosition::Right => (
-                anchor.x.saturating_add(CARET_INDICATOR_X_GAP),
+                anchor.x.saturating_add(x_gap),
                 anchor.bottom.saturating_sub(height),
             ),
             IndicatorPosition::Above => (
-                anchor.x.saturating_add(CARET_INDICATOR_X_GAP),
+                anchor.x.saturating_add(x_gap),
                 anchor
                     .top
-                    .saturating_sub(CARET_INDICATOR_VERTICAL_GAP)
+                    .saturating_sub(vertical_gap)
                     .saturating_sub(height),
             ),
             IndicatorPosition::Below => (
-                anchor.x.saturating_add(CARET_INDICATOR_X_GAP),
-                anchor.bottom.saturating_add(CARET_INDICATOR_VERTICAL_GAP),
+                anchor.x.saturating_add(x_gap),
+                anchor.bottom.saturating_add(vertical_gap),
             ),
         };
 
@@ -2399,16 +2452,16 @@ mod windows_app {
             _ if x.saturating_add(width) > bounds.right => {
                 x = anchor
                     .x
-                    .saturating_sub(CARET_INDICATOR_X_GAP)
+                    .saturating_sub(x_gap)
                     .saturating_sub(width);
             }
             IndicatorPosition::Above if y < bounds.top => {
-                y = anchor.bottom.saturating_add(CARET_INDICATOR_VERTICAL_GAP);
+                y = anchor.bottom.saturating_add(vertical_gap);
             }
             IndicatorPosition::Below if y.saturating_add(height) > bounds.bottom => {
                 y = anchor
                     .top
-                    .saturating_sub(CARET_INDICATOR_VERTICAL_GAP)
+                    .saturating_sub(vertical_gap)
                     .saturating_sub(height);
             }
             _ => {}
@@ -2418,6 +2471,44 @@ mod windows_app {
             clamp_coordinate(x, bounds.left, max_x),
             clamp_coordinate(y, bounds.top, max_y),
         )
+    }
+
+    fn proportional_indicator_metric(base: i32, extent: i32, base_extent: i32) -> i32 {
+        base.saturating_mul(extent)
+            .saturating_add(base_extent / 2)
+            / base_extent.max(1)
+    }
+
+    fn scale_for_dpi(value: i32, dpi: u32) -> i32 {
+        value
+            .saturating_mul(dpi.max(1) as i32)
+            .saturating_add(DEFAULT_DPI as i32 / 2)
+            / DEFAULT_DPI as i32
+    }
+
+    unsafe fn window_dpi(window: HWND) -> u32 {
+        if window.is_null() {
+            return DEFAULT_DPI;
+        }
+        let dpi = GetDpiForWindow(window);
+        if dpi == 0 { DEFAULT_DPI } else { dpi }
+    }
+
+    unsafe fn monitor_dpi_at_point(point: POINT) -> Option<u32> {
+        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_null() {
+            return None;
+        }
+
+        let mut dpi_x = 0;
+        let mut dpi_y = 0;
+        if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) == S_OK
+            && dpi_x != 0
+        {
+            Some(dpi_x)
+        } else {
+            None
+        }
     }
 
     fn classify_ime(snapshot: ImeSnapshot) -> ImeKind {
@@ -2924,7 +3015,7 @@ mod windows_app {
 
         #[test]
         fn tray_tooltip_contains_program_name_and_version() {
-            assert_eq!(tray_tooltip_text(), "IME Caret 1.6");
+            assert_eq!(tray_tooltip_text(), "IME Caret 1.7");
         }
 
         #[test]
