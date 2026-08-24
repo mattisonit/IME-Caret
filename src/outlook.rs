@@ -17,7 +17,10 @@ const IID_IDISPATCH: GUID = GUID {
 };
 const DISPATCH_METHOD: u16 = 0x1;
 const DISPATCH_PROPERTYGET: u16 = 0x2;
+const OUTLOOK_APPOINTMENT_ITEM_CLASS: i32 = 26;
+const OUTLOOK_CONTACT_ITEM_CLASS: i32 = 40;
 const OUTLOOK_MAIL_ITEM_CLASS: i32 = 43;
+const OUTLOOK_TASK_ITEM_CLASS: i32 = 48;
 const WINDOW_TITLE_CAPACITY: usize = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,8 +98,9 @@ impl Drop for OwnedVariant {
 }
 
 /// Uses Outlook's own item state instead of transient Word-editor caret
-/// details. Sent mail is a viewer, unsent mail is a composer, and an Explorer
-/// is editable only while it owns an active inline response.
+/// details. Sent mail is a viewer, unsent mail is a composer, Outlook form
+/// items with Word-backed bodies are editors, and an Explorer is editable only
+/// while it owns an active inline response.
 pub unsafe fn editor_state(foreground: HWND) -> OutlookEditorState {
     if foreground.is_null() {
         return OutlookEditorState::Unknown;
@@ -155,13 +159,22 @@ unsafe fn inspector_editor_state(inspector: *mut c_void) -> OutlookEditorState {
     };
     let item_class = dispatch_invoke(item, "Class", DISPATCH_PROPERTYGET)
         .and_then(|value| value.integer());
-    if item_class != Some(OUTLOOK_MAIL_ITEM_CLASS) {
-        return OutlookEditorState::Unknown;
-    }
-    match dispatch_invoke(item, "Sent", DISPATCH_PROPERTYGET).and_then(|value| value.boolean()) {
-        Some(false) => OutlookEditorState::Editable,
-        Some(true) => OutlookEditorState::ReadOnly,
-        None => OutlookEditorState::Unknown,
+    match item_class {
+        Some(OUTLOOK_MAIL_ITEM_CLASS) => {
+            match dispatch_invoke(item, "Sent", DISPATCH_PROPERTYGET)
+                .and_then(|value| value.boolean())
+            {
+                Some(false) => OutlookEditorState::Editable,
+                Some(true) => OutlookEditorState::ReadOnly,
+                None => OutlookEditorState::Unknown,
+            }
+        }
+        Some(
+            OUTLOOK_APPOINTMENT_ITEM_CLASS
+            | OUTLOOK_CONTACT_ITEM_CLASS
+            | OUTLOOK_TASK_ITEM_CLASS,
+        ) => OutlookEditorState::Editable,
+        _ => OutlookEditorState::Unknown,
     }
 }
 
