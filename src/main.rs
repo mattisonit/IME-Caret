@@ -26,7 +26,7 @@ fn main() {
 #[cfg(windows)]
 mod windows_app {
     use crate::assets::*;
-    use crate::config::{Config, IndicatorPosition};
+    use crate::config::{Config, IndicatorPosition, RgbaColor};
     use crate::editability::{CaretAnchor, EditabilityDetector, FocusedInputHost};
     use crate::ime::{is_modern_shell_overlay_window, ImeEngine, ImeSnapshot, Validity};
     use crate::win::*;
@@ -40,7 +40,7 @@ mod windows_app {
     use std::time::{Duration, Instant};
 
     const APP_NAME: &str = "IME Caret";
-    const APP_VERSION: &str = "1.8";
+    const APP_VERSION: &str = "1.9";
     const MAIN_CLASS: &str = "ImeCaret.MainWindow";
     const BADGE_CLASS: &str = "ImeCaret.BadgeWindow";
     const SETTINGS_CLASS: &str = "ImeCaret.SettingsWindow";
@@ -81,7 +81,6 @@ mod windows_app {
     const CARET_INDICATOR_VERTICAL_GAP: i32 = 2;
     const DEFAULT_DPI: u32 = 96;
     const SHELL_OVERLAY_EDGE_GAP: i32 = 0;
-    const CARET_INDICATOR_ALPHA: u8 = 165;
 
     const WIN_EVENT_FLAG_FOREGROUND: u32 = 1 << 0;
     const WIN_EVENT_FLAG_FOCUS: u32 = 1 << 1;
@@ -95,7 +94,7 @@ mod windows_app {
     static WIN_EVENT_ALLOWED_HOST_PROCESS_ID: AtomicU32 = AtomicU32::new(0);
 
     const SETTINGS_CLIENT_WIDTH: i32 = 414;
-    const SETTINGS_CLIENT_HEIGHT: i32 = 286;
+    const SETTINGS_CLIENT_HEIGHT: i32 = 402;
     const SETTINGS_WINDOW_STYLE: DWORD = WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
     const SETTINGS_WINDOW_EX_STYLE: DWORD = WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT;
     const SETTINGS_HORIZONTAL_MARGIN: i32 = 18;
@@ -110,6 +109,7 @@ mod windows_app {
     const SETTINGS_GROUP_CAPTION_VISUAL_INSET: i32 = 9;
     const SETTINGS_POSITION_CONTROL_GAP: i32 = 8;
     const SETTINGS_POSITION_COMBO_WIDTH: i32 = 176;
+    const SETTINGS_COLOR_EDIT_WIDTH: i32 = 176;
 
     const MENU_TOGGLE_SOUND: u16 = 1001;
     const MENU_SETTINGS: u16 = 1002;
@@ -121,6 +121,10 @@ mod windows_app {
     const CTRL_PLAY_JAPANESE: u16 = 2103;
     const CTRL_PLAY_KOREAN: u16 = 2104;
     const CTRL_INDICATOR_POSITION: u16 = 2105;
+    const CTRL_INDICATOR_TEXT_COLOR: u16 = 2106;
+    const CTRL_ENGLISH_BACKGROUND_COLOR: u16 = 2107;
+    const CTRL_JAPANESE_BACKGROUND_COLOR: u16 = 2108;
+    const CTRL_KOREAN_BACKGROUND_COLOR: u16 = 2109;
     const CTRL_OK: u16 = IDOK;
     const CTRL_CANCEL: u16 = IDCANCEL;
 
@@ -218,7 +222,8 @@ mod windows_app {
         badge_visible: bool,
         badge_kind: Option<ImeKind>,
         badge_text: Vec<u16>,
-        badge_color: COLORREF,
+        badge_text_color: RgbaColor,
+        badge_background_color: RgbaColor,
         badge_position: Option<(i32, i32)>,
         badge_size: Option<(i32, i32)>,
         cleaning_up: bool,
@@ -263,7 +268,7 @@ mod windows_app {
                 taskbar_created_message,
                 exe_dir,
                 config_path,
-                config,
+                config: config.clone(),
                 ime_engine: ImeEngine::default(),
                 editability_detector: EditabilityDetector::new(),
                 icons,
@@ -275,7 +280,8 @@ mod windows_app {
                 badge_visible: false,
                 badge_kind: None,
                 badge_text: wide_without_null("A"),
-                badge_color: rgb(0x55, 0x55, 0x55),
+                badge_text_color: config.indicator_text_color,
+                badge_background_color: config.english_background_color,
                 badge_position: None,
                 badge_size: None,
                 cleaning_up: false,
@@ -751,27 +757,29 @@ mod windows_app {
                 return;
             }
 
-            let (text, color) = match kind {
-                ImeKind::Korean => ("가", rgb(0x62, 0x62, 0x62)),
-                ImeKind::JapaneseHiragana => ("ひ", rgb(0x62, 0x62, 0x62)),
-                ImeKind::JapaneseKatakana => ("カ", rgb(0x62, 0x62, 0x62)),
-                ImeKind::English if caps => ("A", rgb(0x62, 0x62, 0x62)),
-                ImeKind::English => ("a", rgb(0x62, 0x62, 0x62)),
+            let (text, background_color) = match kind {
+                ImeKind::Korean => ("가", self.config.korean_background_color),
+                ImeKind::JapaneseHiragana => ("ひ", self.config.japanese_background_color),
+                ImeKind::JapaneseKatakana => ("カ", self.config.japanese_background_color),
+                ImeKind::English if caps => ("A", self.config.english_background_color),
+                ImeKind::English => ("a", self.config.english_background_color),
                 ImeKind::Unsupported => {
                     self.hide_badge();
                     return;
                 }
             };
+            let text_color = self.config.indicator_text_color;
 
             let next_text = wide_without_null(text);
-            if self.badge_kind != Some(kind)
+            let appearance_changed = self.badge_kind != Some(kind)
                 || self.badge_text != next_text
-                || self.badge_color != color
-            {
+                || self.badge_text_color != text_color
+                || self.badge_background_color != background_color;
+            if appearance_changed {
                 self.badge_kind = Some(kind);
                 self.badge_text = next_text;
-                self.badge_color = color;
-                InvalidateRect(self.badge_hwnd, null(), TRUE);
+                self.badge_text_color = text_color;
+                self.badge_background_color = background_color;
             }
 
             let dpi = monitor_dpi_at_point(POINT {
@@ -789,22 +797,35 @@ mod windows_app {
                 self.config.indicator_position,
                 shell_overlay,
             );
-            if !self.badge_visible
-                || self.badge_position != Some((x, y))
-                || self.badge_size != Some((badge_width, badge_height))
-            {
+            let size_changed = self.badge_size != Some((badge_width, badge_height));
+            let needs_render = !self.badge_visible || size_changed || appearance_changed;
+            if needs_render {
+                if !render_layered_badge(
+                    self.badge_hwnd,
+                    x,
+                    y,
+                    badge_width,
+                    badge_height,
+                    &mut self.badge_text,
+                    self.badge_text_color,
+                    self.badge_background_color,
+                ) {
+                    self.hide_badge();
+                    return;
+                }
+                self.badge_position = Some((x, y));
+                self.badge_size = Some((badge_width, badge_height));
+            } else if self.badge_position != Some((x, y)) {
                 SetWindowPos(
                     self.badge_hwnd,
                     HWND_TOPMOST,
                     x,
                     y,
-                    badge_width,
-                    badge_height,
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
                 );
                 self.badge_position = Some((x, y));
-                self.badge_size = Some((badge_width, badge_height));
-                InvalidateRect(self.badge_hwnd, null(), TRUE);
             }
             self.badge_visible = true;
         }
@@ -1167,7 +1188,26 @@ mod windows_app {
             SetForegroundWindow(hwnd);
         }
 
-        unsafe fn apply_settings_from_window(&mut self, hwnd: HWND) {
+        unsafe fn apply_settings_from_window(&mut self, hwnd: HWND) -> bool {
+            let color_fields = [
+                (CTRL_INDICATOR_TEXT_COLOR, "상태 표시 글자색"),
+                (CTRL_ENGLISH_BACKGROUND_COLOR, "영문 배경색"),
+                (CTRL_JAPANESE_BACKGROUND_COLOR, "일본어 배경색"),
+                (CTRL_KOREAN_BACKGROUND_COLOR, "한글 배경색"),
+            ];
+            let mut colors = [self.config.indicator_text_color; 4];
+            for ((control_id, label), color) in color_fields.into_iter().zip(&mut colors) {
+                let Some(value) = read_control_text(hwnd, control_id) else {
+                    show_invalid_color_message(hwnd, label);
+                    return false;
+                };
+                let Some(parsed) = RgbaColor::parse(&value) else {
+                    show_invalid_color_message(hwnd, label);
+                    return false;
+                };
+                *color = parsed;
+            }
+
             self.config.play_sounds = read_checkbox(hwnd, CTRL_PLAY_ALL);
             self.config.play_english_sound = read_checkbox(hwnd, CTRL_PLAY_ENGLISH);
             self.config.play_japanese_sound = read_checkbox(hwnd, CTRL_PLAY_JAPANESE);
@@ -1175,9 +1215,14 @@ mod windows_app {
             if let Some(index) = read_combo_selection(hwnd, CTRL_INDICATOR_POSITION) {
                 self.config.indicator_position = IndicatorPosition::from_combo_index(index);
             }
+            self.config.indicator_text_color = colors[0];
+            self.config.english_background_color = colors[1];
+            self.config.japanese_background_color = colors[2];
+            self.config.korean_background_color = colors[3];
             self.save_config();
 
             self.old_kind = None;
+            true
         }
 
         unsafe fn save_config(&self) {
@@ -1762,62 +1807,8 @@ mod windows_app {
         match message {
             WM_NCHITTEST => HTTRANSPARENT,
             WM_PAINT => {
-                let state_ptr = get_window_long_ptr(hwnd, GWLP_USERDATA) as *mut AppState;
                 let mut paint: PAINTSTRUCT = zeroed();
-                let dc = BeginPaint(hwnd, &mut paint);
-                if !dc.is_null() && !state_ptr.is_null() {
-                    let state = &mut *state_ptr;
-                    let mut rect = RECT::default();
-                    GetClientRect(hwnd, &mut rect);
-                    let brush = CreateSolidBrush(state.badge_color);
-                    if !brush.is_null() {
-                        FillRect(dc, &rect, brush);
-                        DeleteObject(brush as HGDIOBJ);
-                    }
-
-                    SetBkMode(dc, TRANSPARENT);
-                    SetTextColor(dc, rgb(0xff, 0xff, 0xff));
-                    let font_face = wide("Segoe UI");
-                    let created_font = CreateFontW(
-                        -scale_for_dpi(CARET_INDICATOR_FONT_HEIGHT, window_dpi(hwnd)),
-                        0,
-                        0,
-                        0,
-                        400,
-                        FALSE as DWORD,
-                        FALSE as DWORD,
-                        FALSE as DWORD,
-                        1,
-                        0,
-                        0,
-                        0,
-                        0,
-                        font_face.as_ptr(),
-                    );
-                    let font = if created_font.is_null() {
-                        GetStockObject(DEFAULT_GUI_FONT)
-                    } else {
-                        created_font as HGDIOBJ
-                    };
-                    let old_font = if font.is_null() {
-                        null_mut()
-                    } else {
-                        SelectObject(dc, font)
-                    };
-                    DrawTextW(
-                        dc,
-                        state.badge_text.as_mut_ptr(),
-                        state.badge_text.len() as i32,
-                        &mut rect,
-                        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-                    );
-                    if !old_font.is_null() {
-                        SelectObject(dc, old_font);
-                    }
-                    if !created_font.is_null() {
-                        DeleteObject(created_font as HGDIOBJ);
-                    }
-                }
+                BeginPaint(hwnd, &mut paint);
                 EndPaint(hwnd, &paint);
                 0
             }
@@ -1854,8 +1845,9 @@ mod windows_app {
                 if notification == BN_CLICKED {
                     match control_id {
                         CTRL_OK => {
-                            (&mut *state_ptr).apply_settings_from_window(hwnd);
-                            DestroyWindow(hwnd);
+                            if (&mut *state_ptr).apply_settings_from_window(hwnd) {
+                                DestroyWindow(hwnd);
+                            }
                         }
                         CTRL_CANCEL => {
                             DestroyWindow(hwnd);
@@ -1901,10 +1893,203 @@ mod windows_app {
             state as *mut AppState as *const c_void,
         );
         if !hwnd.is_null() {
-            SetLayeredWindowAttributes(hwnd, 0, CARET_INDICATOR_ALPHA, LWA_ALPHA);
             ShowWindow(hwnd, SW_HIDE);
         }
         hwnd
+    }
+
+    unsafe fn render_layered_badge(
+        hwnd: HWND,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        text: &mut [u16],
+        text_color: RgbaColor,
+        background_color: RgbaColor,
+    ) -> bool {
+        if hwnd.is_null() || width <= 0 || height <= 0 {
+            return false;
+        }
+
+        let screen_dc = GetDC(null_mut());
+        if screen_dc.is_null() {
+            return false;
+        }
+        let memory_dc = CreateCompatibleDC(screen_dc);
+        if memory_dc.is_null() {
+            ReleaseDC(null_mut(), screen_dc);
+            return false;
+        }
+
+        let mut bitmap_info = BITMAPINFO::default();
+        bitmap_info.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as DWORD;
+        bitmap_info.bmiHeader.biWidth = width;
+        bitmap_info.bmiHeader.biHeight = -height;
+        bitmap_info.bmiHeader.biPlanes = 1;
+        bitmap_info.bmiHeader.biBitCount = 32;
+        bitmap_info.bmiHeader.biCompression = BI_RGB;
+
+        let mut bits = null_mut();
+        let bitmap = CreateDIBSection(
+            screen_dc,
+            &bitmap_info,
+            DIB_RGB_COLORS,
+            &mut bits,
+            null_mut(),
+            0,
+        );
+        if bitmap.is_null() || bits.is_null() {
+            if !bitmap.is_null() {
+                DeleteObject(bitmap as HGDIOBJ);
+            }
+            DeleteDC(memory_dc);
+            ReleaseDC(null_mut(), screen_dc);
+            return false;
+        }
+
+        let old_bitmap = SelectObject(memory_dc, bitmap as HGDIOBJ);
+        let pixel_count = (width as usize).saturating_mul(height as usize);
+        let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, pixel_count);
+        pixels.fill(0);
+
+        SetBkMode(memory_dc, OPAQUE);
+        SetBkColor(memory_dc, rgb(0, 0, 0));
+        SetTextColor(memory_dc, rgb(0xff, 0xff, 0xff));
+        let font_face = wide("Segoe UI");
+        let font_height = proportional_indicator_metric(
+            CARET_INDICATOR_FONT_HEIGHT,
+            height,
+            CARET_INDICATOR_HEIGHT,
+        );
+        let created_font = CreateFontW(
+            -font_height,
+            0,
+            0,
+            0,
+            400,
+            FALSE as DWORD,
+            FALSE as DWORD,
+            FALSE as DWORD,
+            1,
+            0,
+            0,
+            ANTIALIASED_QUALITY,
+            0,
+            font_face.as_ptr(),
+        );
+        let font = if created_font.is_null() {
+            GetStockObject(DEFAULT_GUI_FONT)
+        } else {
+            created_font as HGDIOBJ
+        };
+        let old_font = if font.is_null() {
+            null_mut()
+        } else {
+            SelectObject(memory_dc, font)
+        };
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        DrawTextW(
+            memory_dc,
+            text.as_mut_ptr(),
+            text.len() as i32,
+            &mut rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+        if !old_font.is_null() {
+            SelectObject(memory_dc, old_font);
+        }
+        if !created_font.is_null() {
+            DeleteObject(created_font as HGDIOBJ);
+        }
+
+        for pixel in pixels {
+            let blue = (*pixel & 0xff) as u16;
+            let green = ((*pixel >> 8) & 0xff) as u16;
+            let red = ((*pixel >> 16) & 0xff) as u16;
+            let coverage = ((red + green + blue + 1) / 3) as u8;
+            *pixel = compose_badge_pixel(text_color, background_color, coverage);
+        }
+
+        let destination = POINT { x, y };
+        let size = SIZE {
+            cx: width,
+            cy: height,
+        };
+        let source = POINT { x: 0, y: 0 };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER,
+            BlendFlags: 0,
+            SourceConstantAlpha: 0xff,
+            AlphaFormat: AC_SRC_ALPHA,
+        };
+        let updated = UpdateLayeredWindow(
+            hwnd,
+            screen_dc,
+            &destination,
+            &size,
+            memory_dc,
+            &source,
+            0,
+            &blend,
+            ULW_ALPHA,
+        ) != FALSE;
+
+        if !old_bitmap.is_null() {
+            SelectObject(memory_dc, old_bitmap);
+        }
+        DeleteObject(bitmap as HGDIOBJ);
+        DeleteDC(memory_dc);
+        ReleaseDC(null_mut(), screen_dc);
+
+        if updated {
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        updated
+    }
+
+    fn compose_badge_pixel(
+        text: RgbaColor,
+        background: RgbaColor,
+        text_coverage: u8,
+    ) -> u32 {
+        let alpha = interpolate_u8(background.alpha, text.alpha, text_coverage);
+        let red = interpolate_u8(
+            multiply_u8(background.red, background.alpha),
+            multiply_u8(text.red, text.alpha),
+            text_coverage,
+        );
+        let green = interpolate_u8(
+            multiply_u8(background.green, background.alpha),
+            multiply_u8(text.green, text.alpha),
+            text_coverage,
+        );
+        let blue = interpolate_u8(
+            multiply_u8(background.blue, background.alpha),
+            multiply_u8(text.blue, text.alpha),
+            text_coverage,
+        );
+        u32::from(blue)
+            | (u32::from(green) << 8)
+            | (u32::from(red) << 16)
+            | (u32::from(alpha) << 24)
+    }
+
+    fn multiply_u8(left: u8, right: u8) -> u8 {
+        ((u16::from(left) * u16::from(right) + 127) / 255) as u8
+    }
+
+    fn interpolate_u8(from: u8, to: u8, amount: u8) -> u8 {
+        let inverse = 0xff - amount;
+        ((u32::from(from) * u32::from(inverse)
+            + u32::from(to) * u32::from(amount)
+            + 127)
+            / 255) as u8
     }
 
     #[derive(Clone, Copy)]
@@ -1941,7 +2126,7 @@ mod windows_app {
                 rect.bottom.saturating_sub(rect.top),
             )
         } else {
-            (430, 335)
+            (430, 451)
         }
     }
 
@@ -2000,6 +2185,30 @@ mod windows_app {
             },
             combo: RECT {
                 left: combo_left,
+                top: y.saturating_sub(3),
+                right: content_right,
+                bottom: y.saturating_add(22),
+            },
+        }
+    }
+
+    fn settings_color_layout(layout: SettingsLayout, y: i32) -> SettingsPositionLayout {
+        let content_right = layout.content_left.saturating_add(layout.content_width);
+        let edit_width = SETTINGS_COLOR_EDIT_WIDTH.min(
+            layout
+                .content_width
+                .saturating_sub(SETTINGS_POSITION_CONTROL_GAP + 1),
+        );
+        let edit_left = content_right.saturating_sub(edit_width);
+        SettingsPositionLayout {
+            label: RECT {
+                left: layout.content_left,
+                top: y,
+                right: edit_left.saturating_sub(SETTINGS_POSITION_CONTROL_GAP),
+                bottom: y.saturating_add(22),
+            },
+            combo: RECT {
+                left: edit_left,
                 top: y.saturating_sub(3),
                 right: content_right,
                 bottom: y.saturating_add(22),
@@ -2090,7 +2299,7 @@ mod windows_app {
             state,
             hwnd,
             "STATIC",
-            "한/영 표시 위치",
+            "상태 표시 위치",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
             position_layout.label.left,
             position_layout.label.top,
@@ -2114,7 +2323,7 @@ mod windows_app {
             font,
         );
         if !position_combo.is_null() {
-            for label in ["캐럿 오른쪽 (기본)", "캐럿 위", "캐럿 아래"] {
+            for label in ["캐럿 오른쪽", "캐럿 위", "캐럿 아래"] {
                 let label = wide(label);
                 SendMessageW(position_combo, CB_ADDSTRING, 0, label.as_ptr() as LPARAM);
             }
@@ -2124,6 +2333,68 @@ mod windows_app {
                 state.config.indicator_position.combo_index(),
                 0,
             );
+        }
+
+        y += 29;
+        let color_fields = [
+            (
+                CTRL_INDICATOR_TEXT_COLOR,
+                "상태 표시 글자색",
+                state.config.indicator_text_color,
+            ),
+            (
+                CTRL_ENGLISH_BACKGROUND_COLOR,
+                "영문 배경색",
+                state.config.english_background_color,
+            ),
+            (
+                CTRL_JAPANESE_BACKGROUND_COLOR,
+                "일본어 배경색",
+                state.config.japanese_background_color,
+            ),
+            (
+                CTRL_KOREAN_BACKGROUND_COLOR,
+                "한글 배경색",
+                state.config.korean_background_color,
+            ),
+        ];
+        for (id, label, color) in color_fields {
+            let field_layout = settings_color_layout(layout, y);
+            create_control(
+                state,
+                hwnd,
+                "STATIC",
+                label,
+                WS_CHILD | WS_VISIBLE | SS_LEFT,
+                field_layout.label.left,
+                field_layout.label.top,
+                field_layout.label.right - field_layout.label.left,
+                field_layout.label.bottom - field_layout.label.top,
+                0,
+                font,
+            );
+            let edit = create_control(
+                state,
+                hwnd,
+                "EDIT",
+                &color.as_rrggbbaa(),
+                WS_CHILD
+                    | WS_VISIBLE
+                    | WS_TABSTOP
+                    | WS_BORDER
+                    | ES_UPPERCASE
+                    | ES_AUTOHSCROLL,
+                field_layout.combo.left,
+                field_layout.combo.top,
+                field_layout.combo.right - field_layout.combo.left,
+                field_layout.combo.bottom - field_layout.combo.top,
+                id,
+                font,
+            );
+            if !edit.is_null() {
+                SendMessageW(edit, EM_SETLIMITTEXT, 8, 0);
+            }
+            y += 29;
         }
 
         create_control(
@@ -2206,6 +2477,24 @@ mod windows_app {
         } else {
             Some(selected as usize)
         }
+    }
+
+    unsafe fn read_control_text(parent: HWND, id: u16) -> Option<String> {
+        let control = GetDlgItem(parent, id as i32);
+        if control.is_null() {
+            return None;
+        }
+        let mut buffer = [0u16; 9];
+        let length = GetWindowTextW(control, buffer.as_mut_ptr(), buffer.len() as i32);
+        (length >= 0).then(|| String::from_utf16_lossy(&buffer[..length as usize]))
+    }
+
+    unsafe fn show_invalid_color_message(parent: HWND, label: &str) {
+        let text = wide(&format!(
+            "{label} 값은 RRGGBBAA 형식의 8자리 16진수여야 합니다.\n\n예: 626262A5"
+        ));
+        let title = wide(&format!("{APP_NAME} 설정 오류"));
+        MessageBoxW(parent, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
     }
 
     fn centered_window_position(width: i32, height: i32, bounds: RECT) -> (i32, i32) {
@@ -2977,6 +3266,7 @@ mod windows_app {
             let first_control_top = visual_group_top + SETTINGS_CONTENT_VERTICAL_MARGIN;
             let position_y = first_control_top + 4 * 29 + 5;
             let position = settings_position_layout(layout, position_y);
+            let last_color = settings_color_layout(layout, position_y + 4 * 29);
 
             assert_eq!(layout.group.left, SETTINGS_HORIZONTAL_MARGIN);
             assert_eq!(
@@ -3009,13 +3299,14 @@ mod windows_app {
             );
             assert_eq!(
                 first_control_top - visual_group_top,
-                layout.group.bottom - position.label.bottom
+                layout.group.bottom - last_color.label.bottom
             );
+            assert_eq!(position.combo.right, last_color.combo.right);
         }
 
         #[test]
         fn tray_tooltip_contains_program_name_and_version() {
-            assert_eq!(tray_tooltip_text(), "IME Caret 1.8");
+            assert_eq!(tray_tooltip_text(), "IME Caret 1.9");
         }
 
         #[test]

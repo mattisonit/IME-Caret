@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dependency-free static checks for IME Caret 1.8."""
+"""Dependency-free static checks for IME Caret 1.9."""
 
 from __future__ import annotations
 
@@ -121,9 +121,9 @@ def main() -> None:
 
     cargo = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
     assert cargo["package"]["name"] == "ime-caret"
-    assert cargo["package"]["version"] == "1.8.0"
+    assert cargo["package"]["version"] == "1.9.0"
     assert 'name = "ime-caret"' in (ROOT / "Cargo.lock").read_text(encoding="utf-8")
-    assert 'version = "1.8.0"' in (ROOT / "Cargo.lock").read_text(encoding="utf-8")
+    assert 'version = "1.9.0"' in (ROOT / "Cargo.lock").read_text(encoding="utf-8")
     assert "active editable text caret" in cargo["package"]["description"]
 
     main_rs = (SRC / "main.rs").read_text(encoding="utf-8")
@@ -136,7 +136,7 @@ def main() -> None:
     all_source = "\n".join([main_rs, ime_rs, editability_rs, outlook_rs, config_rs, win_rs, assets_rs])
 
     assert 'const APP_NAME: &str = "IME Caret";' in main_rs
-    assert 'const APP_VERSION: &str = "1.8";' in main_rs
+    assert 'const APP_VERSION: &str = "1.9";' in main_rs
     assert "tray_tooltip_text()" in main_rs
     assert 'PathBuf::from("IME Caret.exe")' in main_rs
     assert 'exe_dir.join("IMECaret.ini")' in main_rs
@@ -191,7 +191,9 @@ def main() -> None:
     assert "const CARET_INDICATOR_WIDTH: i32 = 15;" in main_rs
     assert "const CARET_INDICATOR_HEIGHT: i32 = 15;" in main_rs
     assert "const CARET_INDICATOR_X_GAP: i32 = 4;" in main_rs
-    assert "const CARET_INDICATOR_ALPHA: u8 = 165;" in main_rs
+    assert "render_layered_badge" in main_rs
+    assert "UpdateLayeredWindow" in all_source
+    assert "AC_SRC_ALPHA" in all_source
     assert "const ACTIVE_IME_POLL_INTERVAL_MS: u32 = 100;" in main_rs
     assert "const RAW_INPUT_ACTIVE_POLL_INTERVAL_MS: u32 = 500;" in main_rs
     assert "const FALLBACK_REFRESH_INTERVAL_MS: u32 = 500;" in main_rs
@@ -260,7 +262,7 @@ def main() -> None:
     assert "if event == EVENT_SYSTEM_FOREGROUND" in main_rs
     assert "const FOCUS_PROBE_CACHE_DURATION: Duration = Duration::from_millis(250);" in editability_rs
     assert "caret_indicator_position_in_bounds" in main_rs
-    assert "const SETTINGS_CLIENT_HEIGHT: i32 = 286;" in main_rs
+    assert "const SETTINGS_CLIENT_HEIGHT: i32 = 402;" in main_rs
     assert "const SETTINGS_HORIZONTAL_MARGIN: i32 = 18;" in main_rs
     assert "const SETTINGS_BOTTOM_MARGIN: i32 = 18;" in main_rs
     assert "const SETTINGS_GROUP_BUTTON_GAP: i32 = 14;" in main_rs
@@ -275,9 +277,23 @@ def main() -> None:
     assert 'wide("설정을 변경하려면 우클릭하세요.")' in main_rs
     assert "NIF_SHOWTIP" in main_rs
     assert "const TRAY_HINT_DISPLAY_MS: u32 = 2_000;" in main_rs
-    assert '("가", rgb(0x62, 0x62, 0x62))' in main_rs
-    assert '("A", rgb(0x62, 0x62, 0x62))' in main_rs
-    assert '("a", rgb(0x62, 0x62, 0x62))' in main_rs
+    assert '"IndicatorTextColor={}\\r\\n"' in config_rs
+    assert '"EnglishBackgroundColor={}\\r\\n"' in config_rs
+    assert '"JapaneseBackgroundColor={}\\r\\n"' in config_rs
+    assert '"KoreanBackgroundColor={}\\r\\n"' in config_rs
+    assert '"상태 표시 글자색"' in main_rs
+    assert '"영문 배경색"' in main_rs
+    assert '"일본어 배경색"' in main_rs
+    assert '"한글 배경색"' in main_rs
+    assert '"상태 표시 위치"' in main_rs
+    assert '"한/영 표시 위치"' not in main_rs
+    assert "play_sounds: false" in config_rs
+    assert "indicator_position: IndicatorPosition::Below" in config_rs
+    assert '"캐럿 오른쪽", "캐럿 위", "캐럿 아래"' in main_rs
+    assert '"캐럿 오른쪽 (기본)"' not in main_rs
+    assert "RgbaColor::new(0xff, 0x62, 0x62, 0xa5)" in config_rs
+    assert "RgbaColor::new(0x62, 0xff, 0x62, 0xa5)" in config_rs
+    assert "RgbaColor::new(0x62, 0x62, 0xff, 0xa5)" in config_rs
     assert "accepts_text_input" in editability_rs
     assert "UIA_HAS_KEYBOARD_FOCUS_PROPERTY_ID" in editability_rs
     assert "descendant_caret_anchor" in editability_rs
@@ -422,7 +438,7 @@ def main() -> None:
             assert audio.getframerate() == 22050
             assert audio.getnframes() > 0
 
-    print("IME Caret 1.8 static checks passed")
+    print("IME Caret 1.9 static checks passed")
 
 
 if __name__ == "__main__":

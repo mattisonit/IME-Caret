@@ -29,6 +29,7 @@ pub type HMENU = *mut c_void;
 pub type HICON = *mut c_void;
 pub type HCURSOR = *mut c_void;
 pub type HBRUSH = *mut c_void;
+pub type HBITMAP = *mut c_void;
 pub type HDC = *mut c_void;
 pub type HGDIOBJ = *mut c_void;
 pub type HFONT = *mut c_void;
@@ -236,6 +237,54 @@ pub struct PAINTSTRUCT {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SIZE {
+    pub cx: i32,
+    pub cy: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct RGBQUAD {
+    pub rgbBlue: u8,
+    pub rgbGreen: u8,
+    pub rgbRed: u8,
+    pub rgbReserved: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct BITMAPINFOHEADER {
+    pub biSize: DWORD,
+    pub biWidth: LONG,
+    pub biHeight: LONG,
+    pub biPlanes: WORD,
+    pub biBitCount: WORD,
+    pub biCompression: DWORD,
+    pub biSizeImage: DWORD,
+    pub biXPelsPerMeter: LONG,
+    pub biYPelsPerMeter: LONG,
+    pub biClrUsed: DWORD,
+    pub biClrImportant: DWORD,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct BITMAPINFO {
+    pub bmiHeader: BITMAPINFOHEADER,
+    pub bmiColors: [RGBQUAD; 1],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct BLENDFUNCTION {
+    pub BlendOp: u8,
+    pub BlendFlags: u8,
+    pub SourceConstantAlpha: u8,
+    pub AlphaFormat: u8,
+}
+
+#[repr(C)]
 pub struct GUITHREADINFO {
     pub cbSize: DWORD,
     pub flags: DWORD,
@@ -424,6 +473,9 @@ pub const BN_CLICKED: u16 = 0;
 pub const IDOK: u16 = 1;
 pub const IDCANCEL: u16 = 2;
 pub const ES_READONLY: DWORD = 0x0000_0800;
+pub const ES_UPPERCASE: DWORD = 0x0000_0008;
+pub const ES_AUTOHSCROLL: DWORD = 0x0000_0080;
+pub const EM_SETLIMITTEXT: UINT = 0x00C5;
 pub const SCI_GETREADONLY: UINT = 2140;
 
 // Get/SetWindowLongPtr.
@@ -433,6 +485,7 @@ pub const GWLP_USERDATA: i32 = -21;
 // ShowWindow and SetWindowPos.
 pub const SW_HIDE: i32 = 0;
 pub const SW_SHOW: i32 = 5;
+pub const SW_SHOWNOACTIVATE: i32 = 4;
 pub const SW_SHOWNORMAL: i32 = 1;
 pub const SWP_NOSIZE: UINT = 0x0001;
 pub const SWP_NOMOVE: UINT = 0x0002;
@@ -496,11 +549,18 @@ pub const TPM_NONOTIFY: UINT = 0x0080;
 pub const COLOR_WINDOW: usize = 5;
 pub const DEFAULT_GUI_FONT: i32 = 17;
 pub const TRANSPARENT: i32 = 1;
+pub const OPAQUE: i32 = 2;
 pub const DT_CENTER: UINT = 0x0000_0001;
 pub const DT_VCENTER: UINT = 0x0000_0004;
 pub const DT_SINGLELINE: UINT = 0x0000_0020;
 pub const DT_CALCRECT: UINT = 0x0000_0400;
 pub const LWA_ALPHA: DWORD = 0x0000_0002;
+pub const ULW_ALPHA: DWORD = 0x0000_0002;
+pub const AC_SRC_OVER: u8 = 0x00;
+pub const AC_SRC_ALPHA: u8 = 0x01;
+pub const BI_RGB: DWORD = 0;
+pub const DIB_RGB_COLORS: UINT = 0;
+pub const ANTIALIASED_QUALITY: DWORD = 4;
 
 // System metrics.
 pub const SM_XVIRTUALSCREEN: i32 = 76;
@@ -749,6 +809,17 @@ extern "system" {
         bAlpha: u8,
         dwFlags: DWORD,
     ) -> BOOL;
+    pub fn UpdateLayeredWindow(
+        hwnd: HWND,
+        hdcDst: HDC,
+        pptDst: *const POINT,
+        psize: *const SIZE,
+        hdcSrc: HDC,
+        pptSrc: *const POINT,
+        crKey: COLORREF,
+        pblend: *const BLENDFUNCTION,
+        dwFlags: DWORD,
+    ) -> BOOL;
     pub fn InvalidateRect(hWnd: HWND, lpRect: *const RECT, bErase: BOOL) -> BOOL;
     pub fn BeginPaint(hWnd: HWND, lpPaint: *mut PAINTSTRUCT) -> HDC;
     pub fn EndPaint(hWnd: HWND, lpPaint: *const PAINTSTRUCT) -> BOOL;
@@ -843,9 +914,20 @@ extern "system" {
         pszFaceName: PCWSTR,
     ) -> HFONT;
     pub fn CreateSolidBrush(color: COLORREF) -> HBRUSH;
+    pub fn CreateCompatibleDC(hdc: HDC) -> HDC;
+    pub fn DeleteDC(hdc: HDC) -> BOOL;
+    pub fn CreateDIBSection(
+        hdc: HDC,
+        pbmi: *const BITMAPINFO,
+        usage: UINT,
+        bits: *mut *mut c_void,
+        section: HANDLE,
+        offset: DWORD,
+    ) -> HBITMAP;
     pub fn DeleteObject(ho: HGDIOBJ) -> BOOL;
     pub fn SelectObject(hdc: HDC, h: HGDIOBJ) -> HGDIOBJ;
     pub fn SetBkMode(hdc: HDC, mode: i32) -> i32;
+    pub fn SetBkColor(hdc: HDC, color: COLORREF) -> COLORREF;
     pub fn SetTextColor(hdc: HDC, color: COLORREF) -> COLORREF;
 }
 
