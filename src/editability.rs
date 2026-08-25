@@ -420,6 +420,38 @@ impl EditabilityDetector {
             };
         }
 
+        // Excel uses private editor windows instead of a standard Edit
+        // control. EXCEL6 is the in-cell editor (including current Microsoft
+        // 365 builds), EXCEL< is the formula-bar editor, and EDTBX is used by
+        // classic Find/Replace dialogs. Prefer Excel's GUI-thread caret and
+        // fall back to its Active Accessibility caret when Office doesn't
+        // publish a UI Automation text range.
+        if let Some(window) = excel_editor_window(targets) {
+            if let Some(anchor) = win32_caret_anchor(targets) {
+                return Some(anchor);
+            }
+            if let Some(anchor) = accessible_system_caret_anchor(window)
+                .filter(|anchor| anchor_matches_window(*anchor, window))
+            {
+                return Some(anchor);
+            }
+            if let CaretProbeResult::Found(anchor) =
+                self.uia_focused_caret_anchor(targets, false, false)
+            {
+                return Some(anchor);
+            }
+            if let Some(anchor) = self.excel_dialog_focused_element_anchor(targets) {
+                return Some(anchor);
+            }
+            return excel_dialog_editor_bounds_anchor(targets, window);
+        }
+        if let Some(anchor) = self.excel_dialog_focused_element_anchor(targets) {
+            return Some(anchor);
+        }
+        if let Some(anchor) = excel_dialog_caret_anchor(targets) {
+            return Some(anchor);
+        }
+
         // Outlook's classic mail composer hosts its message body in Word's
         // innermost _WwG document window. Outlook 2016 exposes a GUI-thread
         // caret for read-only message viewers, while the editable composer
@@ -599,6 +631,23 @@ impl EditabilityDetector {
         }
 
         let foreground_class = window_class_name(targets.foreground).unwrap_or_default();
+        if excel_editor_window(targets).is_some()
+            || self
+                .excel_dialog_focused_element_anchor(targets)
+                .is_some()
+            || excel_dialog_caret_anchor(targets).is_some()
+        {
+            let result = Editability::Editable;
+            self.last_focus_probe = Some(CachedFocusProbe {
+                foreground: targets.foreground,
+                focus: targets.focus,
+                caret: targets.caret,
+                result,
+                tick: now,
+            });
+            return result;
+        }
+
         if foreground_class.eq_ignore_ascii_case("OpusApp")
             && [targets.caret, targets.focus].into_iter().any(|window| {
                 !window.is_null()
@@ -697,6 +746,49 @@ impl EditabilityDetector {
             tick: now,
         });
         result
+    }
+
+    unsafe fn excel_dialog_focused_element_anchor(
+        &mut self,
+        targets: ForegroundFocusTargets,
+    ) -> Option<CaretAnchor> {
+        let dialog = excel_dialog_root_for_targets(targets)?;
+        let mut element = self.focused_element_for_targets(targets)?;
+        let mut anchor = None;
+
+        // Excel 2016's Find/Replace dialog can focus its first field without
+        // creating either a Win32 or Active Accessibility caret. UI
+        // Automation still exposes the focused Edit element, so use the
+        // field's left inset as a temporary anchor until typing creates the
+        // real caret. Keep this fallback strictly inside bosa_sdm_XL dialogs.
+        for _ in 0..=MAX_UIA_PARENT_DEPTH {
+            let class_name = property_string(element, UIA_CLASS_NAME_PROPERTY_ID)
+                .unwrap_or_default();
+            let control_type = property_i32(element, UIA_CONTROL_TYPE_PROPERTY_ID);
+            let is_editor = property_bool(element, UIA_IS_ENABLED_PROPERTY_ID) != Some(false)
+                && (class_name.eq_ignore_ascii_case("EDTBX")
+                    || class_name.eq_ignore_ascii_case("Edit")
+                    || control_type == Some(UIA_EDIT_CONTROL_TYPE_ID)
+                    || matches!(inspect_element(element), NodeEvidence::EditableField));
+
+            if is_editor {
+                anchor = property_bounding_rect(element)
+                    .and_then(editable_element_caret_anchor)
+                    .filter(|candidate| anchor_matches_window(*candidate, dialog));
+                break;
+            }
+
+            if self.raw_view_walker.is_null() {
+                break;
+            }
+            let Some(parent) = tree_walker_parent(self.raw_view_walker, element) else {
+                break;
+            };
+            release_com(element);
+            element = parent;
+        }
+        release_com(element);
+        anchor
     }
 
     unsafe fn classify_office_word_editor_target(
@@ -1594,6 +1686,202 @@ fn is_chromium_widget_class(class_name: &str) -> bool {
 
 fn is_office_uia_preferred_caret_class(class_name: &str) -> bool {
     class_name.eq_ignore_ascii_case("PPTFrameClass")
+}
+
+unsafe fn excel_editor_window(targets: ForegroundFocusTargets) -> Option<HWND> {
+    if !is_excel_host_window(targets.foreground) {
+        return None;
+    }
+
+    for start in [targets.caret, targets.focus] {
+        let mut window = start;
+        for _ in 0..=4 {
+            if window.is_null() {
+                break;
+            }
+            if IsWindowEnabled(window) != FALSE
+                && window_class_name(window)
+                    .is_some_and(|class_name| is_excel_editor_class(&class_name))
+            {
+                return Some(window);
+            }
+            let parent = GetParent(window);
+            if parent.is_null() || parent == window {
+                break;
+            }
+            window = parent;
+        }
+    }
+    None
+}
+
+unsafe fn is_excel_host_window(window: HWND) -> bool {
+    if window.is_null() {
+        return false;
+    }
+
+    let root = GetAncestor(window, GA_ROOT);
+    let root_owner = GetAncestor(window, GA_ROOTOWNER);
+    [window, root, root_owner].into_iter().any(|candidate| {
+        !candidate.is_null()
+            && window_class_name(candidate)
+                .is_some_and(|class_name| is_excel_host_class(&class_name))
+    })
+}
+
+fn is_excel_host_class(class_name: &str) -> bool {
+    let normalized = class_name.to_ascii_lowercase();
+    normalized == "xlmain" || normalized.starts_with("bosa_sdm_xl")
+}
+
+fn is_excel_editor_class(class_name: &str) -> bool {
+    matches!(
+        class_name.to_ascii_lowercase().as_str(),
+        "excel6" | "excel<" | "edtbx"
+    )
+}
+
+#[derive(Default)]
+struct ExcelDialogCaretSearch {
+    anchor: Option<CaretAnchor>,
+    fallback: Option<CaretAnchor>,
+}
+
+unsafe fn excel_dialog_caret_anchor(targets: ForegroundFocusTargets) -> Option<CaretAnchor> {
+    let dialog = excel_dialog_root_for_targets(targets)?;
+    let mut search = ExcelDialogCaretSearch::default();
+    EnumChildWindows(
+        dialog,
+        Some(enum_excel_dialog_caret),
+        &mut search as *mut ExcelDialogCaretSearch as LPARAM,
+    );
+    search.anchor.or(search.fallback)
+}
+
+unsafe fn excel_dialog_root_for_targets(targets: ForegroundFocusTargets) -> Option<HWND> {
+    [targets.focus, targets.caret, targets.foreground]
+        .into_iter()
+        .find_map(|window| excel_dialog_root(window))
+        .or_else(|| excel_dialog_for_process(targets.process_id))
+}
+
+unsafe fn excel_dialog_root(window: HWND) -> Option<HWND> {
+    if window.is_null() {
+        return None;
+    }
+    let root = GetAncestor(window, GA_ROOT);
+    let root_owner = GetAncestor(window, GA_ROOTOWNER);
+    [window, root, root_owner].into_iter().find(|candidate| {
+        !candidate.is_null()
+            && window_class_name(*candidate)
+                .is_some_and(|class_name| is_excel_dialog_class(&class_name))
+    })
+}
+
+fn is_excel_dialog_class(class_name: &str) -> bool {
+    class_name
+        .to_ascii_lowercase()
+        .starts_with("bosa_sdm_xl")
+}
+
+#[derive(Default)]
+struct ExcelDialogWindowSearch {
+    process_id: u32,
+    dialog: HWND,
+}
+
+unsafe fn excel_dialog_for_process(process_id: u32) -> Option<HWND> {
+    if process_id == 0 {
+        return None;
+    }
+    let mut search = ExcelDialogWindowSearch {
+        process_id,
+        dialog: null_mut(),
+    };
+    EnumWindows(
+        Some(enum_excel_dialog_window),
+        &mut search as *mut ExcelDialogWindowSearch as LPARAM,
+    );
+    (!search.dialog.is_null()).then_some(search.dialog)
+}
+
+unsafe extern "system" fn enum_excel_dialog_window(window: HWND, parameter: LPARAM) -> BOOL {
+    if parameter == 0
+        || IsWindowEnabled(window) == FALSE
+        || IsWindowVisible(window) == FALSE
+        || !window_class_name(window)
+            .is_some_and(|class_name| is_excel_dialog_class(&class_name))
+    {
+        return TRUE;
+    }
+
+    let search = &mut *(parameter as *mut ExcelDialogWindowSearch);
+    let mut process_id = 0;
+    GetWindowThreadProcessId(window, &mut process_id);
+    if process_id != search.process_id {
+        return TRUE;
+    }
+
+    search.dialog = window;
+    FALSE
+}
+
+unsafe fn excel_dialog_editor_bounds_anchor(
+    targets: ForegroundFocusTargets,
+    editor: HWND,
+) -> Option<CaretAnchor> {
+    excel_dialog_root_for_targets(targets)?;
+    if !window_class_name(editor).is_some_and(|class_name| {
+        class_name.eq_ignore_ascii_case("EDTBX") || class_name.eq_ignore_ascii_case("Edit")
+    }) {
+        return None;
+    }
+
+    excel_editor_bounds_anchor(editor)
+}
+
+unsafe fn excel_editor_bounds_anchor(editor: HWND) -> Option<CaretAnchor> {
+    let mut rect = RECT::default();
+    if GetWindowRect(editor, &mut rect) == FALSE
+        || rect.right <= rect.left
+        || rect.bottom <= rect.top
+    {
+        return None;
+    }
+    let vertical_inset = ((rect.bottom - rect.top) / 6).clamp(2, 6);
+    Some(CaretAnchor {
+        x: rect.left.saturating_add(4),
+        top: rect.top.saturating_add(vertical_inset),
+        bottom: rect.bottom.saturating_sub(vertical_inset),
+    })
+}
+
+unsafe extern "system" fn enum_excel_dialog_caret(window: HWND, parameter: LPARAM) -> BOOL {
+    if parameter == 0 || IsWindowEnabled(window) == FALSE {
+        return TRUE;
+    }
+    let Some(class_name) = window_class_name(window) else {
+        return TRUE;
+    };
+    if !class_name.eq_ignore_ascii_case("EDTBX")
+        && !class_name.eq_ignore_ascii_case("Edit")
+    {
+        return TRUE;
+    }
+
+    let search = &mut *(parameter as *mut ExcelDialogCaretSearch);
+    if search.fallback.is_none() {
+        search.fallback = excel_editor_bounds_anchor(window);
+    }
+
+    if let Some(anchor) = accessible_system_caret_anchor(window)
+        .filter(|anchor| anchor_matches_window(*anchor, window))
+    {
+        search.anchor = Some(anchor);
+        FALSE
+    } else {
+        TRUE
+    }
 }
 
 unsafe fn office_accessible_caret_anchor(

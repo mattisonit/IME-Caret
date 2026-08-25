@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dependency-free static checks for IME Caret 1.9."""
+"""Dependency-free static checks for IME Caret 2.0."""
 
 from __future__ import annotations
 
@@ -121,9 +121,9 @@ def main() -> None:
 
     cargo = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
     assert cargo["package"]["name"] == "ime-caret"
-    assert cargo["package"]["version"] == "1.9.0"
+    assert cargo["package"]["version"] == "2.0.0"
     assert 'name = "ime-caret"' in (ROOT / "Cargo.lock").read_text(encoding="utf-8")
-    assert 'version = "1.9.0"' in (ROOT / "Cargo.lock").read_text(encoding="utf-8")
+    assert 'version = "2.0.0"' in (ROOT / "Cargo.lock").read_text(encoding="utf-8")
     assert "active editable text caret" in cargo["package"]["description"]
 
     main_rs = (SRC / "main.rs").read_text(encoding="utf-8")
@@ -136,7 +136,7 @@ def main() -> None:
     all_source = "\n".join([main_rs, ime_rs, editability_rs, outlook_rs, config_rs, win_rs, assets_rs])
 
     assert 'const APP_NAME: &str = "IME Caret";' in main_rs
-    assert 'const APP_VERSION: &str = "1.9";' in main_rs
+    assert 'const APP_VERSION: &str = "2.0";' in main_rs
     assert "tray_tooltip_text()" in main_rs
     assert 'PathBuf::from("IME Caret.exe")' in main_rs
     assert 'exe_dir.join("IMECaret.ini")' in main_rs
@@ -294,6 +294,26 @@ def main() -> None:
     assert "RgbaColor::new(0xff, 0x62, 0x62, 0xa5)" in config_rs
     assert "RgbaColor::new(0x62, 0xff, 0x62, 0xa5)" in config_rs
     assert "RgbaColor::new(0x62, 0x62, 0xff, 0xa5)" in config_rs
+    assert "excel_editor_window" in editability_rs
+    assert '"excel6" | "excel<" | "edtbx"' in editability_rs
+    assert 'normalized == "xlmain" || normalized.starts_with("bosa_sdm_xl")' in editability_rs
+    assert "excel_dialog_caret_anchor" in editability_rs
+    assert "EnumChildWindows(" in editability_rs
+    assert 'class_name.eq_ignore_ascii_case("EDTBX")' in editability_rs
+assert "excel_dialog_editor_bounds_anchor" in editability_rs
+assert "for _ in 0..=4" in editability_rs
+assert "excel_dialog_focused_element_anchor" in editability_rs
+assert "UI Automation still exposes the focused Edit element" in editability_rs
+assert "excel_dialog_root_for_targets" in editability_rs
+assert "excel_dialog_for_process" in editability_rs
+assert "search.anchor.or(search.fallback)" in editability_rs
+assert "delayed_focus_surface_pending" in main_rs
+assert "raw_keyboard_signal_opens_delayed_focus_surface" in main_rs
+assert "DELAYED_FOCUS_SURFACE_RETRY_COUNT" in main_rs
+assert "schedule_delayed_focus_surface_retry_if_needed" in main_rs
+assert "Reassert topmost only" in main_rs
+assert "is_excel_find_replace_foreground" in main_rs
+assert "refresh the badge's topmost order" in main_rs
     assert "accepts_text_input" in editability_rs
     assert "UIA_HAS_KEYBOARD_FOCUS_PROPERTY_ID" in editability_rs
     assert "descendant_caret_anchor" in editability_rs
@@ -438,7 +458,7 @@ def main() -> None:
             assert audio.getframerate() == 22050
             assert audio.getnframes() > 0
 
-    print("IME Caret 1.9 static checks passed")
+    print("IME Caret 2.0 static checks passed")
 
 
 if __name__ == "__main__":

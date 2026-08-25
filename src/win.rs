@@ -747,6 +747,7 @@ extern "system" {
     pub fn GetAncestor(hWnd: HWND, gaFlags: UINT) -> HWND;
     pub fn IsWindow(hWnd: HWND) -> BOOL;
     pub fn IsWindowEnabled(hWnd: HWND) -> BOOL;
+    pub fn IsWindowVisible(hWnd: HWND) -> BOOL;
     pub fn GetClassNameW(hWnd: HWND, lpClassName: PWSTR, nMaxCount: i32) -> i32;
     pub fn GetWindowTextW(hWnd: HWND, lpString: PWSTR, nMaxCount: i32) -> i32;
 

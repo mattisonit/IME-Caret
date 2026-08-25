@@ -40,7 +40,7 @@ mod windows_app {
     use std::time::{Duration, Instant};
 
     const APP_NAME: &str = "IME Caret";
-    const APP_VERSION: &str = "1.9";
+    const APP_VERSION: &str = "2.0";
     const MAIN_CLASS: &str = "ImeCaret.MainWindow";
     const BADGE_CLASS: &str = "ImeCaret.BadgeWindow";
     const SETTINGS_CLASS: &str = "ImeCaret.SettingsWindow";
@@ -62,6 +62,7 @@ mod windows_app {
     const EVENT_REFRESH_MIN_INTERVAL: Duration = Duration::from_millis(50);
     const KEYBOARD_ACTIVITY_DELAY_MS: u32 = 20;
     const FOCUS_ACTIVATION_RETRY_COUNT: u8 = 3;
+    const DELAYED_FOCUS_SURFACE_RETRY_COUNT: u8 = 3;
     const RAW_INPUT_DUPLICATE_WINDOW: Duration = Duration::from_millis(2);
     const ACTIVITY_BACKOFF_DELAY: Duration = Duration::from_secs(3);
     const DEEP_IDLE_BACKOFF_DELAY: Duration = Duration::from_secs(15);
@@ -236,6 +237,8 @@ mod windows_app {
         last_raw_keyboard_signal: Option<LastRawKeyboardSignal>,
         keyboard_activity_pending: bool,
         keyboard_activity_covered_by_caret_event: bool,
+        delayed_focus_surface_pending: bool,
+        delayed_focus_surface_retries_remaining: u8,
         poll_interval_ms: u32,
         last_activity: Instant,
         last_full_refresh: Option<Instant>,
@@ -294,6 +297,8 @@ mod windows_app {
                 last_raw_keyboard_signal: None,
                 keyboard_activity_pending: false,
                 keyboard_activity_covered_by_caret_event: false,
+                delayed_focus_surface_pending: false,
+                delayed_focus_surface_retries_remaining: 0,
                 poll_interval_ms: 0,
                 last_activity: Instant::now(),
                 last_full_refresh: None,
@@ -324,6 +329,7 @@ mod windows_app {
             if self.full_refresh_pending {
                 self.refresh_from_active_caret();
                 self.schedule_focus_activation_retry_if_needed();
+                self.schedule_delayed_focus_surface_retry_if_needed();
                 self.reschedule_poll_timer();
                 return;
             }
@@ -362,6 +368,7 @@ mod windows_app {
             }
 
             let now = Instant::now();
+            let mut delayed_focus_surface = false;
             let refresh_candidate = if let Some(signal) = signal {
                 let duplicate =
                     raw_keyboard_signal_is_duplicate(self.last_raw_keyboard_signal, signal, now);
@@ -369,6 +376,7 @@ mod windows_app {
                 if duplicate {
                     return;
                 }
+                delayed_focus_surface = raw_keyboard_signal_opens_delayed_focus_surface(signal);
                 raw_keyboard_signal_needs_refresh(signal)
             } else {
                 // If the Raw Input payload couldn't be decoded, preserve the
@@ -376,6 +384,8 @@ mod windows_app {
                 self.last_raw_keyboard_signal = None;
                 true
             };
+
+            self.delayed_focus_surface_pending |= delayed_focus_surface;
 
             self.last_activity = now;
             if !refresh_candidate
@@ -401,8 +411,10 @@ mod windows_app {
                 KillTimer(self.main_hwnd, KEYBOARD_ACTIVITY_TIMER_ID);
             }
             let covered_by_caret_event = self.keyboard_activity_covered_by_caret_event;
+            let delayed_focus_surface = self.delayed_focus_surface_pending;
             self.keyboard_activity_pending = false;
             self.keyboard_activity_covered_by_caret_event = false;
+            self.delayed_focus_surface_pending = false;
             if self.cleaning_up {
                 return;
             }
@@ -415,6 +427,17 @@ mod windows_app {
                 self.refresh_ime_state_only();
             } else if refresh_needed {
                 self.refresh_from_active_caret();
+            }
+            if delayed_focus_surface {
+                // Excel 2016 creates its modeless Find/Replace controls after
+                // the Ctrl+F/H Raw Input signal. The ordinary 20 ms refresh
+                // can therefore still see the worksheet caret. Probe a small
+                // bounded 300 ms window so the dialog is caught after it has
+                // materialized without affecting ordinary keyboard activity.
+                self.editability_detector.invalidate_focus_cache();
+                self.delayed_focus_surface_retries_remaining =
+                    DELAYED_FOCUS_SURFACE_RETRY_COUNT;
+                self.full_refresh_pending = true;
             }
             self.reschedule_poll_timer();
         }
@@ -548,6 +571,38 @@ mod windows_app {
                 // caret shortly after the initial focus/caret notification.
                 // Re-probe on each short activation retry instead of reusing
                 // the transient Unknown result for the whole retry window.
+                self.editability_detector.invalidate_focus_cache();
+                self.full_refresh_pending = true;
+            }
+        }
+
+        unsafe fn schedule_delayed_focus_surface_retry_if_needed(&mut self) {
+            if self.delayed_focus_surface_retries_remaining == 0 {
+                return;
+            }
+
+            // Excel's modeless Find/Replace dialog can complete its Z-order
+            // activation after the badge has already been shown. When the
+            // caret position is unchanged, the ordinary lightweight update
+            // deliberately skips SetWindowPos, leaving the badge underneath
+            // the dialog until typing moves the caret. Reassert topmost only
+            // during these bounded Ctrl+F/H activation retries.
+            if self.badge_visible {
+                if let Some((x, y)) = self.badge_position {
+                    SetWindowPos(
+                        self.badge_hwnd,
+                        HWND_TOPMOST,
+                        x,
+                        y,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    );
+                }
+            }
+
+            self.delayed_focus_surface_retries_remaining -= 1;
+            if self.delayed_focus_surface_retries_remaining > 0 {
                 self.editability_detector.invalidate_focus_cache();
                 self.full_refresh_pending = true;
             }
@@ -826,6 +881,23 @@ mod windows_app {
                     SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
                 );
                 self.badge_position = Some((x, y));
+            }
+
+            // Excel's modeless Find/Replace window can reassert its Z-order
+            // after the initial activation retries have finished. In that
+            // dialog, refresh the badge's topmost order even when the caret
+            // geometry is unchanged; otherwise the badge can remain hidden
+            // until typing or moving the dialog changes its position.
+            if is_excel_find_replace_foreground() {
+                SetWindowPos(
+                    self.badge_hwnd,
+                    HWND_TOPMOST,
+                    x,
+                    y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
             }
             self.badge_visible = true;
         }
@@ -1273,6 +1345,8 @@ mod windows_app {
             }
             self.keyboard_activity_pending = false;
             self.keyboard_activity_covered_by_caret_event = false;
+            self.delayed_focus_surface_pending = false;
+            self.delayed_focus_surface_retries_remaining = 0;
             self.poll_interval_ms = 0;
             self.clear_active_caret();
             self.hide_badge();
@@ -1427,6 +1501,27 @@ mod windows_app {
     unsafe fn raw_keyboard_signal_needs_refresh(signal: RawKeyboardSignal) -> bool {
         let virtual_key = signal.virtual_key as i32;
         raw_keyboard_key_can_change_ime(virtual_key) || keyboard_modifier_is_down()
+    }
+
+    unsafe fn raw_keyboard_signal_opens_delayed_focus_surface(signal: RawKeyboardSignal) -> bool {
+        matches!(signal.virtual_key, 0x46 | 0x48) && GetAsyncKeyState(VK_CONTROL) < 0
+    }
+
+    unsafe fn is_excel_find_replace_foreground() -> bool {
+        let foreground = GetForegroundWindow();
+        if foreground.is_null() {
+            return false;
+        }
+        let mut class_name = [0u16; 64];
+        let length = GetClassNameW(
+            foreground,
+            class_name.as_mut_ptr(),
+            class_name.len() as i32,
+        );
+        length > 0
+            && String::from_utf16_lossy(&class_name[..length as usize])
+                .to_ascii_lowercase()
+                .starts_with("bosa_sdm_xl")
     }
 
     fn raw_keyboard_key_can_change_ime(virtual_key: i32) -> bool {
@@ -3306,7 +3401,7 @@ mod windows_app {
 
         #[test]
         fn tray_tooltip_contains_program_name_and_version() {
-            assert_eq!(tray_tooltip_text(), "IME Caret 1.9");
+            assert_eq!(tray_tooltip_text(), "IME Caret 2.0");
         }
 
         #[test]
