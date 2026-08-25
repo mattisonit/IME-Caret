@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dependency-free static checks for IME Caret 2.0."""
+"""Dependency-free static checks for IME Caret 2.1."""
 
 from __future__ import annotations
 
@@ -121,9 +121,9 @@ def main() -> None:
 
     cargo = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
     assert cargo["package"]["name"] == "ime-caret"
-    assert cargo["package"]["version"] == "2.0.0"
+    assert cargo["package"]["version"] == "2.1.0"
     assert 'name = "ime-caret"' in (ROOT / "Cargo.lock").read_text(encoding="utf-8")
-    assert 'version = "2.0.0"' in (ROOT / "Cargo.lock").read_text(encoding="utf-8")
+    assert 'version = "2.1.0"' in (ROOT / "Cargo.lock").read_text(encoding="utf-8")
     assert "active editable text caret" in cargo["package"]["description"]
 
     main_rs = (SRC / "main.rs").read_text(encoding="utf-8")
@@ -136,7 +136,7 @@ def main() -> None:
     all_source = "\n".join([main_rs, ime_rs, editability_rs, outlook_rs, config_rs, win_rs, assets_rs])
 
     assert 'const APP_NAME: &str = "IME Caret";' in main_rs
-    assert 'const APP_VERSION: &str = "2.0";' in main_rs
+    assert 'const APP_VERSION: &str = "2.1";' in main_rs
     assert "tray_tooltip_text()" in main_rs
     assert 'PathBuf::from("IME Caret.exe")' in main_rs
     assert 'exe_dir.join("IMECaret.ini")' in main_rs
@@ -314,6 +314,9 @@ assert "schedule_delayed_focus_surface_retry_if_needed" in main_rs
 assert "Reassert topmost only" in main_rs
 assert "is_excel_find_replace_foreground" in main_rs
 assert "refresh the badge's topmost order" in main_rs
+assert "WIN_EVENT_FLAG_WINDOW_LOCATION" in main_rs
+assert "object_id == OBJID_WINDOW" in main_rs
+assert "A top-level move changes the caret's screen coordinates" in main_rs
     assert "accepts_text_input" in editability_rs
     assert "UIA_HAS_KEYBOARD_FOCUS_PROPERTY_ID" in editability_rs
     assert "descendant_caret_anchor" in editability_rs
@@ -458,7 +461,7 @@ assert "refresh the badge's topmost order" in main_rs
             assert audio.getframerate() == 22050
             assert audio.getnframes() > 0
 
-    print("IME Caret 2.0 static checks passed")
+    print("IME Caret 2.1 static checks passed")
 
 
 if __name__ == "__main__":

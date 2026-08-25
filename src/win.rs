@@ -415,6 +415,7 @@ pub const EVENT_OBJECT_LOCATIONCHANGE: DWORD = 0x800B;
 pub const EVENT_OBJECT_TEXTSELECTIONCHANGED: DWORD = 0x8014;
 pub const WINEVENT_OUTOFCONTEXT: DWORD = 0x0000;
 pub const WINEVENT_SKIPOWNPROCESS: DWORD = 0x0002;
+pub const OBJID_WINDOW: LONG = 0;
 pub const OBJID_CARET: LONG = -8;
 
 // Raw Input keyboard activity keeps normal legacy keyboard messages enabled.

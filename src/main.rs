@@ -40,7 +40,7 @@ mod windows_app {
     use std::time::{Duration, Instant};
 
     const APP_NAME: &str = "IME Caret";
-    const APP_VERSION: &str = "2.0";
+    const APP_VERSION: &str = "2.1";
     const MAIN_CLASS: &str = "ImeCaret.MainWindow";
     const BADGE_CLASS: &str = "ImeCaret.BadgeWindow";
     const SETTINGS_CLASS: &str = "ImeCaret.SettingsWindow";
@@ -87,6 +87,7 @@ mod windows_app {
     const WIN_EVENT_FLAG_FOCUS: u32 = 1 << 1;
     const WIN_EVENT_FLAG_CARET: u32 = 1 << 2;
     const WIN_EVENT_FLAG_TEXT_SELECTION: u32 = 1 << 3;
+    const WIN_EVENT_FLAG_WINDOW_LOCATION: u32 = 1 << 4;
     const WIN_EVENT_PRIORITY_FLAGS: u32 = WIN_EVENT_FLAG_FOREGROUND | WIN_EVENT_FLAG_FOCUS;
 
     static WIN_EVENT_TARGET_HWND: AtomicUsize = AtomicUsize::new(0);
@@ -451,6 +452,8 @@ mod windows_app {
                 let caret_event = event_flags
                     & (WIN_EVENT_FLAG_CARET | WIN_EVENT_FLAG_TEXT_SELECTION)
                     != 0;
+                let geometry_event = caret_event
+                    || event_flags & WIN_EVENT_FLAG_WINDOW_LOCATION != 0;
                 let activation_event = priority_event
                     || (caret_event
                         && (!self.badge_visible || self.active_caret_anchor.is_none()));
@@ -472,7 +475,7 @@ mod windows_app {
                     .and_then(|tick| Instant::now().checked_duration_since(tick))
                     .is_some_and(|age| age < EVENT_REFRESH_MIN_INTERVAL);
                 let can_refresh_caret_only = !priority_event
-                    && caret_event
+                    && geometry_event
                     && !self.full_refresh_pending
                     && self.badge_visible
                     && self.active_caret_anchor.is_some()
@@ -1556,6 +1559,9 @@ mod windows_app {
             EVENT_SYSTEM_FOREGROUND => WIN_EVENT_FLAG_FOREGROUND,
             EVENT_OBJECT_FOCUS => WIN_EVENT_FLAG_FOCUS,
             EVENT_OBJECT_LOCATIONCHANGE if object_id == OBJID_CARET => WIN_EVENT_FLAG_CARET,
+            EVENT_OBJECT_LOCATIONCHANGE if object_id == OBJID_WINDOW => {
+                WIN_EVENT_FLAG_WINDOW_LOCATION
+            }
             EVENT_OBJECT_TEXTSELECTIONCHANGED => WIN_EVENT_FLAG_TEXT_SELECTION,
             _ => 0,
         }
@@ -1566,7 +1572,11 @@ mod windows_app {
         win_event_flag(event, object_id) != 0
     }
 
-    unsafe fn win_event_source_is_relevant(event: DWORD, hwnd: HWND) -> bool {
+    unsafe fn win_event_source_is_relevant(
+        event: DWORD,
+        hwnd: HWND,
+        object_id: LONG,
+    ) -> bool {
         // A foreground transition must always be observed. Focus hooks are
         // global, however, and background applications can raise them without
         // changing the user's active editor, so filter focus like caret and
@@ -1581,6 +1591,13 @@ mod windows_app {
         let foreground = GetForegroundWindow();
         if foreground.is_null() {
             return true;
+        }
+        if event == EVENT_OBJECT_LOCATIONCHANGE && object_id == OBJID_WINDOW {
+            // A top-level move changes the caret's screen coordinates without
+            // changing its client-relative rectangle. Limit this high-volume
+            // event to the actual foreground window; child layout changes are
+            // handled by caret/selection events or the existing fallback poll.
+            return hwnd == foreground;
         }
         if hwnd == foreground
             || GetAncestor(hwnd, GA_ROOT) == foreground
@@ -1621,7 +1638,7 @@ mod windows_app {
         _event_time: DWORD,
     ) {
         let event_flag = win_event_flag(event, object_id);
-        if event_flag == 0 || !win_event_source_is_relevant(event, hwnd) {
+        if event_flag == 0 || !win_event_source_is_relevant(event, hwnd, object_id) {
             return;
         }
 
@@ -3401,7 +3418,7 @@ mod windows_app {
 
         #[test]
         fn tray_tooltip_contains_program_name_and_version() {
-            assert_eq!(tray_tooltip_text(), "IME Caret 2.0");
+            assert_eq!(tray_tooltip_text(), "IME Caret 2.1");
         }
 
         #[test]
@@ -3478,7 +3495,10 @@ mod windows_app {
                 OBJID_CARET
             ));
             assert!(is_relevant_win_event(EVENT_OBJECT_TEXTSELECTIONCHANGED, 0));
-            assert!(!is_relevant_win_event(EVENT_OBJECT_LOCATIONCHANGE, 0));
+            assert!(is_relevant_win_event(
+                EVENT_OBJECT_LOCATIONCHANGE,
+                OBJID_WINDOW
+            ));
             assert!(!is_relevant_win_event(0, 0));
             assert_eq!(
                 win_event_flag(EVENT_SYSTEM_FOREGROUND, 0) | win_event_flag(EVENT_OBJECT_FOCUS, 0),
