@@ -1,4 +1,4 @@
-# IME Caret 2.1
+# IME Caret 2.2
 
 Windows에서 현재 입력 가능한 텍스트 캐럿 옆에 IME 상태(한/영/일)를 작게 표시하는 Rust 프로그램입니다.
 
@@ -25,7 +25,7 @@ Windows에서 현재 입력 가능한 텍스트 캐럿 옆에 IME 상태(한/영
 - 상태 표시 위치 설정 (캐럿 우측 / 캐럿 우상단 / 캐럿 우하단)
 - 상태 표시 글자색 및 배경색 설정
 
-기본 설정 파일:
+기본 설정 파일 (IMECaret.ini):
 
 ```ini
 [Settings]
@@ -42,6 +42,10 @@ KoreanBackgroundColor=6262FFA5
 
 `IndicatorPosition`에는 `Right`, `Above`, `Below` 중 하나를 사용할 수 있습니다.
 Color값은 RRGGBBAA 형식입니다 (AA=00이면 완전 투명, AA=FF이면 완전 불투명).
+
+## 2.2 변경 사항
+
+- 중복 포커스·Excel·UIA 탐색과 불필요한 배지 렌더링·할당을 줄여 반응성과 CPU 효율 개선.
 
 ## 2.1 변경 사항
 

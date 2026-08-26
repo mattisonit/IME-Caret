@@ -1,12 +1,13 @@
-use crate::editability::FocusedInputHost;
+use crate::editability::{FocusedInputContext, FocusedInputHost};
 use crate::win::*;
 use std::collections::{HashMap, HashSet};
-use std::mem::{size_of, zeroed};
+use std::mem::size_of;
 use std::ptr::null_mut;
 use std::time::{Duration, Instant};
 
 const CACHE_BRIDGE: Duration = Duration::from_millis(400);
 const CACHE_RETENTION: Duration = Duration::from_secs(10);
+const CACHE_CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 const SHELL_INPUT_WINDOW_CACHE: Duration = Duration::from_secs(1);
 const MAX_ENUMERATED_INPUT_WINDOWS: usize = 128;
 
@@ -62,6 +63,17 @@ struct ForegroundTargets {
     foreground: HWND,
 }
 
+impl From<FocusedInputContext> for ForegroundTargets {
+    fn from(context: FocusedInputContext) -> Self {
+        Self {
+            active: context.active,
+            focus: context.focus,
+            caret: context.caret,
+            foreground: context.foreground,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum CachedLiveSource {
     ImeWindow {
@@ -91,25 +103,42 @@ struct CachedShellInputWindows {
 #[derive(Default)]
 pub struct ImeEngine {
     cache: HashMap<CacheKey, CachedIme>,
+    last_cache_cleanup: Option<Instant>,
     live_target: Option<CachedLiveTarget>,
     shell_input_windows: Option<CachedShellInputWindows>,
 }
 
 impl ImeEngine {
     pub fn query(&mut self, focused_host: FocusedInputHost) -> ImeSnapshot {
-        unsafe { self.query_unsafe(focused_host) }
+        self.query_with_context(focused_host, FocusedInputContext::capture())
     }
 
-    unsafe fn query_unsafe(&mut self, focused_host: FocusedInputHost) -> ImeSnapshot {
+    pub fn query_with_context(
+        &mut self,
+        focused_host: FocusedInputHost,
+        context: FocusedInputContext,
+    ) -> ImeSnapshot {
+        unsafe { self.query_unsafe(focused_host, context.into()) }
+    }
+
+    unsafe fn query_unsafe(
+        &mut self,
+        focused_host: FocusedInputHost,
+        foreground: ForegroundTargets,
+    ) -> ImeSnapshot {
         let now = Instant::now();
-        if self.cache.len() > 128 {
+        let cache_cleanup_due = self
+            .last_cache_cleanup
+            .and_then(|tick| now.checked_duration_since(tick))
+            .map_or(true, |age| age >= CACHE_CLEANUP_INTERVAL);
+        if self.cache.len() > 128 && cache_cleanup_due {
             self.cache.retain(|_, value| {
                 now.checked_duration_since(value.tick)
                     .is_some_and(|age| age <= CACHE_RETENTION)
             });
+            self.last_cache_cleanup = Some(now);
         }
 
-        let foreground = foreground_targets();
         if let Some(snapshot) =
             self.query_cached_live_target(foreground, focused_host, now)
         {
@@ -166,13 +195,13 @@ impl ImeEngine {
         // session. Cache their HWNDs briefly to avoid a process/window scan on
         // every polling tick.
         let initial_candidate_count = candidates.len();
-        for window in self.cached_shell_input_windows(
+        self.append_cached_shell_input_windows(
+            &mut candidates,
+            &mut seen,
             foreground_process_id,
             focused_host.process_id,
             now,
-        ) {
-            add_window_candidate(&mut candidates, &mut seen, window);
-        }
+        );
         if candidates.len() > initial_candidate_count {
             if let Some(snapshot) =
                 self.query_live_candidates(
@@ -186,13 +215,12 @@ impl ImeEngine {
             }
         }
 
-        let first_thread = candidates
-            .iter()
-            .map(|hwnd| window_thread(*hwnd))
-            .find(|thread_id| *thread_id != 0)
-            .unwrap_or(0);
         let target_thread = match window_thread(target) {
-            0 => first_thread,
+            0 => candidates
+                .iter()
+                .map(|hwnd| window_thread(*hwnd))
+                .find(|thread_id| *thread_id != 0)
+                .unwrap_or(0),
             thread_id => thread_id,
         };
         let mut language_id = thread_language(target_thread);
@@ -297,13 +325,11 @@ impl ImeEngine {
 
         let (window, query) = match cached.source {
             CachedLiveSource::ImeWindow { window, ime_window }
-                if IsWindow(window) != FALSE
-                    && IsWindow(ime_window) != FALSE
-                    && ImmGetDefaultIMEWnd(window) == ime_window =>
+                if ImmGetDefaultIMEWnd(window) == ime_window =>
             {
                 (window, query_ime_window(ime_window))
             }
-            CachedLiveSource::InputContext { window } if IsWindow(window) != FALSE => {
+            CachedLiveSource::InputContext { window } => {
                 (window, query_ime_context(window))
             }
             _ => {
@@ -345,40 +371,46 @@ impl ImeEngine {
         }
     }
 
-    unsafe fn cached_shell_input_windows(
+    unsafe fn append_cached_shell_input_windows(
         &mut self,
+        candidates: &mut Vec<HWND>,
+        seen: &mut HashSet<usize>,
         foreground_process_id: u32,
         focused_process_id: u32,
         now: Instant,
-    ) -> Vec<HWND> {
-        if let Some(cached) = &self.shell_input_windows {
-            if cached.foreground_process_id == foreground_process_id
+    ) {
+        let cache_is_current = self.shell_input_windows.as_ref().is_some_and(|cached| {
+            cached.foreground_process_id == foreground_process_id
                 && cached.focused_process_id == focused_process_id
                 && now
                     .checked_duration_since(cached.tick)
                     .is_some_and(|age| age <= SHELL_INPUT_WINDOW_CACHE)
+        });
+
+        if !cache_is_current {
+            let mut windows = Vec::new();
+            let mut cached_seen = HashSet::new();
+            for process_id in
+                modern_shell_input_processes(foreground_process_id, focused_process_id)
             {
-                return cached.windows.clone();
+                add_process_windows(&mut windows, &mut cached_seen, process_id);
+                if windows.len() >= MAX_ENUMERATED_INPUT_WINDOWS {
+                    break;
+                }
             }
+            self.shell_input_windows = Some(CachedShellInputWindows {
+                foreground_process_id,
+                focused_process_id,
+                windows,
+                tick: now,
+            });
         }
 
-        let mut windows = Vec::new();
-        let mut seen = HashSet::new();
-        for process_id in
-            modern_shell_input_processes(foreground_process_id, focused_process_id)
-        {
-            add_process_windows(&mut windows, &mut seen, process_id);
-            if windows.len() >= MAX_ENUMERATED_INPUT_WINDOWS {
-                break;
+        if let Some(cached) = &self.shell_input_windows {
+            for &window in &cached.windows {
+                add_window_candidate(candidates, seen, window);
             }
         }
-        self.shell_input_windows = Some(CachedShellInputWindows {
-            foreground_process_id,
-            focused_process_id,
-            windows: windows.clone(),
-            tick: now,
-        });
-        windows
     }
 }
 
@@ -474,35 +506,6 @@ unsafe fn send_ime_control(ime_window: HWND, command: WPARAM) -> Option<usize> {
     (ok != 0).then_some(result)
 }
 
-unsafe fn foreground_targets() -> ForegroundTargets {
-    let foreground = GetForegroundWindow();
-    let thread_id = window_thread(foreground);
-    let mut result = ForegroundTargets {
-        active: foreground,
-        focus: null_mut(),
-        caret: null_mut(),
-        foreground,
-    };
-
-    if thread_id == 0 {
-        return result;
-    }
-
-    let mut info: GUITHREADINFO = zeroed();
-    info.cbSize = size_of::<GUITHREADINFO>() as u32;
-    if GetGUIThreadInfo(thread_id, &mut info) != FALSE {
-        result.active = if info.hwndActive.is_null() {
-            foreground
-        } else {
-            info.hwndActive
-        };
-        result.focus = info.hwndFocus;
-        result.caret = info.hwndCaret;
-    }
-    result
-}
-
-
 unsafe fn add_window_chain(list: &mut Vec<HWND>, seen: &mut HashSet<usize>, hwnd: HWND) {
     if hwnd.is_null() {
         return;
@@ -524,12 +527,18 @@ unsafe fn add_window_chain(list: &mut Vec<HWND>, seen: &mut HashSet<usize>, hwnd
 }
 
 unsafe fn add_window_candidate(list: &mut Vec<HWND>, seen: &mut HashSet<usize>, hwnd: HWND) {
-    if hwnd.is_null() || IsWindow(hwnd) == FALSE {
+    if hwnd.is_null() {
         return;
     }
-    if seen.insert(hwnd as usize) {
-        list.push(hwnd);
+    let key = hwnd as usize;
+    if !seen.insert(key) {
+        return;
     }
+    if IsWindow(hwnd) == FALSE {
+        seen.remove(&key);
+        return;
+    }
+    list.push(hwnd);
 }
 
 struct ProcessWindowEnumeration {
@@ -619,17 +628,31 @@ unsafe fn modern_shell_input_processes(
         ProcessIdToSessionId(reference_process_id, &mut reference_session) != FALSE;
     let mut entry = PROCESSENTRY32W::default();
     entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
-    let mut processes = Vec::<(u32, String)>::new();
+    let mut shell_has_focus = false;
+    let mut candidates = Vec::<(u8, u8, u32)>::new();
 
     if Process32FirstW(snapshot, &mut entry) != FALSE {
         loop {
             let process_id = entry.th32ProcessID;
-            let mut session_id = 0;
-            let same_session = !filter_session
-                || (ProcessIdToSessionId(process_id, &mut session_id) != FALSE
-                    && session_id == reference_session);
-            if process_id != 0 && same_session {
-                processes.push((process_id, executable_name(&entry.szExeFile)));
+            if process_id != 0 {
+                if let Some(priority) = modern_input_host_priority_utf16(&entry.szExeFile) {
+                    let mut session_id = 0;
+                    let same_session = !filter_session
+                        || (ProcessIdToSessionId(process_id, &mut session_id) != FALSE
+                            && session_id == reference_session);
+                    if same_session {
+                        let focus_priority = if process_id == focused_process_id {
+                            shell_has_focus = true;
+                            0
+                        } else if process_id == foreground_process_id {
+                            shell_has_focus = true;
+                            1
+                        } else {
+                            2
+                        };
+                        candidates.push((focus_priority, priority, process_id));
+                    }
+                }
             }
 
             entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
@@ -640,35 +663,49 @@ unsafe fn modern_shell_input_processes(
     }
     CloseHandle(snapshot);
 
-    let shell_has_focus = processes.iter().any(|(process_id, name)| {
-        (*process_id == foreground_process_id || *process_id == focused_process_id)
-            && is_modern_shell_focus_process(name)
-    });
     if !shell_has_focus {
         return Vec::new();
     }
 
-    let mut candidates = processes
-        .into_iter()
-        .filter_map(|(process_id, name)| {
-            modern_input_host_priority(&name).map(|priority| {
-                let focus_priority = if process_id == focused_process_id {
-                    0
-                } else if process_id == foreground_process_id {
-                    1
-                } else {
-                    2
-                };
-                (focus_priority, priority, process_id)
-            })
-        })
-        .collect::<Vec<_>>();
     candidates.sort_unstable();
     candidates.dedup_by_key(|candidate| candidate.2);
     candidates
         .into_iter()
         .map(|candidate| candidate.2)
         .collect()
+}
+
+fn modern_input_host_priority_utf16(name: &[u16; 260]) -> Option<u8> {
+    if executable_name_eq_ascii_case(name, "textinputhost.exe") {
+        Some(0)
+    } else if executable_name_eq_ascii_case(name, "searchhost.exe")
+        || executable_name_eq_ascii_case(name, "searchapp.exe")
+    {
+        Some(1)
+    } else if executable_name_eq_ascii_case(name, "startmenuexperiencehost.exe") {
+        Some(2)
+    } else if executable_name_eq_ascii_case(name, "shellexperiencehost.exe") {
+        Some(3)
+    } else if executable_name_eq_ascii_case(name, "explorer.exe") {
+        Some(4)
+    } else {
+        None
+    }
+}
+
+fn executable_name_eq_ascii_case(value: &[u16; 260], expected: &str) -> bool {
+    let length = value
+        .iter()
+        .position(|character| *character == 0)
+        .unwrap_or(value.len());
+    length == expected.len()
+        && value[..length]
+            .iter()
+            .zip(expected.bytes())
+            .all(|(actual, expected)| {
+                *actual <= u8::MAX as u16
+                    && (*actual as u8).eq_ignore_ascii_case(&expected)
+            })
 }
 
 fn executable_name(value: &[u16; 260]) -> String {
@@ -679,6 +716,7 @@ fn executable_name(value: &[u16; 260]) -> String {
     String::from_utf16_lossy(&value[..length]).to_ascii_lowercase()
 }
 
+#[cfg(test)]
 fn is_modern_shell_focus_process(name: &str) -> bool {
     matches!(
         name,
@@ -741,6 +779,7 @@ fn is_modern_shell_overlay_process(name: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn modern_input_host_priority(name: &str) -> Option<u8> {
     match name {
         "textinputhost.exe" => Some(0),

@@ -141,6 +141,25 @@ impl Default for FocusedInputHost {
     }
 }
 
+/// A single, internally consistent snapshot of the foreground GUI thread.
+/// Full indicator refreshes share this value across editability, IME, and
+/// caret probes instead of asking User32 for the same state several times.
+#[derive(Clone, Copy)]
+pub struct FocusedInputContext {
+    pub(crate) foreground: HWND,
+    pub(crate) active: HWND,
+    pub(crate) focus: HWND,
+    pub(crate) caret: HWND,
+    pub(crate) caret_rect: RECT,
+    pub(crate) process_id: u32,
+}
+
+impl FocusedInputContext {
+    pub fn capture() -> Self {
+        unsafe { foreground_focus_targets() }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CachedFocusProbe {
     foreground: HWND,
@@ -174,6 +193,55 @@ struct CachedOutlookCaretAnchor {
     window: HWND,
     anchor: CaretAnchor,
     tick: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct ForegroundWindowProfile {
+    window: HWND,
+    console_like: bool,
+    classic_console: bool,
+    uia_preferred: bool,
+    chromium: bool,
+    office_uia_preferred: bool,
+    word_frame: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CachedRefreshProbe {
+    foreground: HWND,
+    focus: HWND,
+    caret: HWND,
+    process_id: u32,
+    standard_editable_checked: bool,
+    standard_editable: bool,
+    editor_checked: bool,
+    editor: Option<HWND>,
+    dialog_checked: bool,
+    dialog: Option<HWND>,
+}
+
+impl CachedRefreshProbe {
+    fn new(context: FocusedInputContext) -> Self {
+        Self {
+            foreground: context.foreground,
+            focus: context.focus,
+            caret: context.caret,
+            process_id: context.process_id,
+            standard_editable_checked: false,
+            standard_editable: false,
+            editor_checked: false,
+            editor: None,
+            dialog_checked: false,
+            dialog: None,
+        }
+    }
+
+    fn matches(self, context: FocusedInputContext) -> bool {
+        self.foreground == context.foreground
+            && self.focus == context.focus
+            && self.caret == context.caret
+            && self.process_id == context.process_id
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -213,6 +281,8 @@ pub struct EditabilityDetector {
     focused_element_cache: Option<CachedFocusedElement>,
     outlook_editability_cache: Option<CachedOutlookEditability>,
     outlook_caret_anchor_cache: Option<CachedOutlookCaretAnchor>,
+    foreground_window_profile: Option<ForegroundWindowProfile>,
+    refresh_probe_cache: Option<CachedRefreshProbe>,
     attached_console_pid: u32,
 }
 
@@ -253,6 +323,8 @@ impl EditabilityDetector {
             focused_element_cache: None,
             outlook_editability_cache: None,
             outlook_caret_anchor_cache: None,
+            foreground_window_profile: None,
+            refresh_probe_cache: None,
             attached_console_pid: 0,
         }
     }
@@ -261,8 +333,11 @@ impl EditabilityDetector {
     /// focused control or caret. This probe is independent of the mouse
     /// position and is used to keep the IME state indicator attached to the
     /// blinking text caret while the pointer is parked elsewhere.
-    pub fn focused_input(&mut self) -> Editability {
-        unsafe { self.focused_input_unsafe() }
+    pub fn focused_input_with_context(&mut self, context: FocusedInputContext) -> Editability {
+        // Begin a new per-refresh probe. The following caret query can reuse
+        // stable control/dialog discovery, while live geometry is reacquired.
+        self.refresh_probe_cache = Some(CachedRefreshProbe::new(context));
+        unsafe { self.focused_input_unsafe(context) }
     }
 
     /// Invalidates only the focus classification cache. Foreground and focus
@@ -272,9 +347,110 @@ impl EditabilityDetector {
         self.last_focus_probe = None;
         self.outlook_editability_cache = None;
         self.outlook_caret_anchor_cache = None;
+        self.foreground_window_profile = None;
+        self.refresh_probe_cache = None;
         unsafe {
             self.clear_focused_element_cache();
         }
+    }
+
+    unsafe fn foreground_window_profile(&mut self, window: HWND) -> ForegroundWindowProfile {
+        if let Some(profile) = self
+            .foreground_window_profile
+            .filter(|profile| profile.window == window)
+        {
+            return profile;
+        }
+
+        let class_name = window_class_name(window).unwrap_or_default();
+        let profile = ForegroundWindowProfile {
+            window,
+            console_like: is_console_like_class(&class_name),
+            classic_console: class_name.eq_ignore_ascii_case("ConsoleWindowClass"),
+            uia_preferred: is_uia_preferred_caret_class(&class_name),
+            chromium: is_chromium_widget_class(&class_name),
+            office_uia_preferred: is_office_uia_preferred_caret_class(&class_name),
+            word_frame: class_name.eq_ignore_ascii_case("OpusApp"),
+        };
+        self.foreground_window_profile = Some(profile);
+        profile
+    }
+
+    fn prepare_refresh_probe_cache(&mut self, context: FocusedInputContext) {
+        if !self
+            .refresh_probe_cache
+            .is_some_and(|cached| cached.matches(context))
+        {
+            self.refresh_probe_cache = Some(CachedRefreshProbe::new(context));
+        }
+    }
+
+    unsafe fn standard_editable_for_refresh(&mut self, context: FocusedInputContext) -> bool {
+        self.prepare_refresh_probe_cache(context);
+        if let Some(cached) = self
+            .refresh_probe_cache
+            .filter(|cached| cached.standard_editable_checked)
+        {
+            return cached.standard_editable;
+        }
+
+        let editable = [context.caret, context.focus].into_iter().any(|window| {
+            !window.is_null()
+                && classify_standard_window(window) == Some(Editability::Editable)
+        });
+        if let Some(cached) = self.refresh_probe_cache.as_mut() {
+            cached.standard_editable_checked = true;
+            cached.standard_editable = editable;
+        }
+        editable
+    }
+
+    unsafe fn excel_editor_window_for_refresh(
+        &mut self,
+        context: FocusedInputContext,
+    ) -> Option<HWND> {
+        self.prepare_refresh_probe_cache(context);
+        if let Some(cached) = self
+            .refresh_probe_cache
+            .filter(|cached| cached.editor_checked)
+        {
+            return cached.editor;
+        }
+
+        let editor = excel_editor_window(context);
+        if let Some(cached) = self.refresh_probe_cache.as_mut() {
+            cached.editor_checked = true;
+            cached.editor = editor;
+        }
+        editor
+    }
+
+    unsafe fn excel_dialog_root_for_refresh(
+        &mut self,
+        context: FocusedInputContext,
+    ) -> Option<HWND> {
+        self.prepare_refresh_probe_cache(context);
+        if let Some(cached) = self
+            .refresh_probe_cache
+            .filter(|cached| cached.dialog_checked)
+        {
+            return cached.dialog;
+        }
+
+        let dialog = excel_dialog_root_for_targets(context);
+        if let Some(cached) = self.refresh_probe_cache.as_mut() {
+            cached.dialog_checked = true;
+            cached.dialog = dialog;
+        }
+        dialog
+    }
+
+    unsafe fn excel_dialog_caret_anchor_for_refresh(
+        &mut self,
+        context: FocusedInputContext,
+    ) -> Option<CaretAnchor> {
+        let dialog = self.excel_dialog_root_for_refresh(context)?;
+        excel_dialog_caret_anchor_in_dialog(dialog)
     }
 
     unsafe fn focused_element_for_targets(
@@ -333,8 +509,11 @@ impl EditabilityDetector {
     /// visible search box in one window while hosting its IME context in
     /// another process, so the IME engine uses this identity as an additional
     /// candidate instead of relying only on GetForegroundWindow.
-    pub fn focused_input_host(&mut self) -> FocusedInputHost {
-        unsafe { self.focused_input_host_unsafe() }
+    pub fn focused_input_host_with_context(
+        &mut self,
+        context: FocusedInputContext,
+    ) -> FocusedInputHost {
+        unsafe { self.focused_input_host_unsafe(context) }
     }
 
     /// Returns a screen-space anchor immediately beside the active text caret.
@@ -343,25 +522,39 @@ impl EditabilityDetector {
     /// at a stale composition start. Other controls use
     /// TextPattern2 and the older TextPattern selection as fallbacks.
     pub fn focused_caret_anchor(&mut self, console_cell_span: i32) -> Option<CaretAnchor> {
-        unsafe { self.focused_caret_anchor_unsafe(console_cell_span.clamp(1, 2)) }
+        // A standalone position refresh must never reuse geometry from an
+        // earlier full refresh.
+        self.refresh_probe_cache = None;
+        self.focused_caret_anchor_with_context(
+            FocusedInputContext::capture(),
+            console_cell_span,
+        )
+    }
+
+    pub fn focused_caret_anchor_with_context(
+        &mut self,
+        context: FocusedInputContext,
+        console_cell_span: i32,
+    ) -> Option<CaretAnchor> {
+        unsafe { self.focused_caret_anchor_unsafe(context, console_cell_span.clamp(1, 2)) }
     }
 
     unsafe fn focused_caret_anchor_unsafe(
         &mut self,
+        targets: ForegroundFocusTargets,
         console_cell_span: i32,
     ) -> Option<CaretAnchor> {
-        let targets = foreground_focus_targets();
         if targets.foreground.is_null() {
             self.detach_console();
             return None;
         }
 
-        let console_like = is_console_like_window(targets.foreground);
-        let classic_console = is_classic_console_window(targets.foreground);
-        let foreground_class = window_class_name(targets.foreground).unwrap_or_default();
-        let uia_preferred = is_uia_preferred_caret_class(&foreground_class);
-        let office_uia_preferred = is_office_uia_preferred_caret_class(&foreground_class);
-        let force_exact_uia_geometry = uia_preferred && is_chromium_widget_class(&foreground_class);
+        let foreground_profile = self.foreground_window_profile(targets.foreground);
+        let console_like = foreground_profile.console_like;
+        let classic_console = foreground_profile.classic_console;
+        let uia_preferred = foreground_profile.uia_preferred;
+        let office_uia_preferred = foreground_profile.office_uia_preferred;
+        let force_exact_uia_geometry = uia_preferred && foreground_profile.chromium;
         if !classic_console {
             self.detach_console();
         }
@@ -420,13 +613,19 @@ impl EditabilityDetector {
             };
         }
 
+        if self.standard_editable_for_refresh(targets) {
+            if let Some(anchor) = win32_caret_anchor(targets) {
+                return Some(anchor);
+            }
+        }
+
         // Excel uses private editor windows instead of a standard Edit
         // control. EXCEL6 is the in-cell editor (including current Microsoft
         // 365 builds), EXCEL< is the formula-bar editor, and EDTBX is used by
         // classic Find/Replace dialogs. Prefer Excel's GUI-thread caret and
         // fall back to its Active Accessibility caret when Office doesn't
         // publish a UI Automation text range.
-        if let Some(window) = excel_editor_window(targets) {
+        if let Some(window) = self.excel_editor_window_for_refresh(targets) {
             if let Some(anchor) = win32_caret_anchor(targets) {
                 return Some(anchor);
             }
@@ -443,12 +642,14 @@ impl EditabilityDetector {
             if let Some(anchor) = self.excel_dialog_focused_element_anchor(targets) {
                 return Some(anchor);
             }
-            return excel_dialog_editor_bounds_anchor(targets, window);
+            return self
+                .excel_dialog_root_for_refresh(targets)
+                .and_then(|_| excel_dialog_editor_bounds_anchor(window));
         }
         if let Some(anchor) = self.excel_dialog_focused_element_anchor(targets) {
             return Some(anchor);
         }
-        if let Some(anchor) = excel_dialog_caret_anchor(targets) {
+        if let Some(anchor) = self.excel_dialog_caret_anchor_for_refresh(targets) {
             return Some(anchor);
         }
 
@@ -607,18 +808,18 @@ impl EditabilityDetector {
         None
     }
 
-    unsafe fn focused_input_unsafe(&mut self) -> Editability {
-        let targets = foreground_focus_targets();
+    unsafe fn focused_input_unsafe(&mut self, targets: ForegroundFocusTargets) -> Editability {
         if targets.foreground.is_null() {
             self.clear_focused_element_cache();
             return Editability::Unknown;
         }
 
         let now = Instant::now();
-        if !is_classic_console_window(targets.foreground) {
+        let foreground_profile = self.foreground_window_profile(targets.foreground);
+        if !foreground_profile.classic_console {
             self.detach_console();
         }
-        if is_console_like_window(targets.foreground) {
+        if foreground_profile.console_like {
             let result = Editability::Editable;
             self.last_focus_probe = Some(CachedFocusProbe {
                 foreground: targets.foreground,
@@ -630,12 +831,28 @@ impl EditabilityDetector {
             return result;
         }
 
-        let foreground_class = window_class_name(targets.foreground).unwrap_or_default();
-        if excel_editor_window(targets).is_some()
+        // Standard Edit/RichEdit/Scintilla controls already provide complete
+        // positive editability evidence. Resolve them before the Office-only
+        // Excel probes so ordinary editors never walk Excel dialog ancestry.
+        if self.standard_editable_for_refresh(targets) {
+            let result = Editability::Editable;
+            self.last_focus_probe = Some(CachedFocusProbe {
+                foreground: targets.foreground,
+                focus: targets.focus,
+                caret: targets.caret,
+                result,
+                tick: now,
+            });
+            return result;
+        }
+
+        if self.excel_editor_window_for_refresh(targets).is_some()
             || self
                 .excel_dialog_focused_element_anchor(targets)
                 .is_some()
-            || excel_dialog_caret_anchor(targets).is_some()
+            || self
+                .excel_dialog_caret_anchor_for_refresh(targets)
+                .is_some()
         {
             let result = Editability::Editable;
             self.last_focus_probe = Some(CachedFocusProbe {
@@ -648,7 +865,7 @@ impl EditabilityDetector {
             return result;
         }
 
-        if foreground_class.eq_ignore_ascii_case("OpusApp")
+        if foreground_profile.word_frame
             && [targets.caret, targets.focus].into_iter().any(|window| {
                 !window.is_null()
                     && IsWindowEnabled(window) != FALSE
@@ -712,7 +929,7 @@ impl EditabilityDetector {
             }
         }
 
-        if is_office_uia_preferred_caret_class(&foreground_class)
+        if foreground_profile.office_uia_preferred
             && office_accessible_caret_anchor(targets).is_some()
         {
             let result = Editability::Editable;
@@ -752,7 +969,7 @@ impl EditabilityDetector {
         &mut self,
         targets: ForegroundFocusTargets,
     ) -> Option<CaretAnchor> {
-        let dialog = excel_dialog_root_for_targets(targets)?;
+        let dialog = self.excel_dialog_root_for_refresh(targets)?;
         let mut element = self.focused_element_for_targets(targets)?;
         let mut anchor = None;
 
@@ -830,12 +1047,14 @@ impl EditabilityDetector {
         None
     }
 
-    unsafe fn focused_input_host_unsafe(&mut self) -> FocusedInputHost {
+    unsafe fn focused_input_host_unsafe(
+        &mut self,
+        targets: ForegroundFocusTargets,
+    ) -> FocusedInputHost {
         if self.automation.is_null() {
             return FocusedInputHost::default();
         }
 
-        let targets = foreground_focus_targets();
         let Some(mut element) = self.focused_element_for_targets(targets) else {
             return FocusedInputHost::default();
         };
@@ -938,7 +1157,10 @@ impl EditabilityDetector {
             }
         }
 
+        let mut initial_subtree_probed = false;
+        let initial_subtree_editable_only = !console_like;
         if !self.raw_view_walker.is_null() {
+            initial_subtree_probed = true;
             let mut remaining = MAX_UIA_CARET_DESCENDANT_NODES;
             let descendant = if console_like {
                 descendant_caret_anchor(
@@ -970,9 +1192,16 @@ impl EditabilityDetector {
             }
         }
 
+        let mut initial_element = true;
         for _ in 0..MAX_UIA_CARET_PARENT_DEPTH {
-            let evidence = inspect_element(element);
-            if evidence_accepts_caret_probe(evidence, console_like, exact_geometry_only) {
+            let evidence = if initial_element {
+                initial_evidence
+            } else {
+                inspect_element(element)
+            };
+            if !initial_element
+                && evidence_accepts_caret_probe(evidence, console_like, exact_geometry_only)
+            {
                 match probe_caret_anchor_from_uia_element(element, exact_geometry_only) {
                     CaretProbeResult::Found(point) => {
                         release_com(element);
@@ -992,7 +1221,10 @@ impl EditabilityDetector {
                 // one of its ancestors. YouTube's search field is a common
                 // example. Search a small, bounded descendant subtree before
                 // using the element rectangle only for a confirmed empty field.
-                if !self.raw_view_walker.is_null() {
+                let initial_subtree_already_probed = initial_element
+                    && initial_subtree_probed
+                    && initial_subtree_editable_only == exact_geometry_only;
+                if !self.raw_view_walker.is_null() && !initial_subtree_already_probed {
                     let mut remaining = MAX_UIA_CARET_DESCENDANT_NODES;
                     let descendant = if exact_geometry_only {
                         descendant_editable_caret_anchor(
@@ -1037,6 +1269,7 @@ impl EditabilityDetector {
             };
             release_com(element);
             element = parent;
+            initial_element = false;
         }
 
         release_com(element);
@@ -1317,14 +1550,7 @@ impl Drop for EditabilityDetector {
     }
 }
 
-#[derive(Clone, Copy)]
-struct ForegroundFocusTargets {
-    foreground: HWND,
-    focus: HWND,
-    caret: HWND,
-    caret_rect: RECT,
-    process_id: u32,
-}
+type ForegroundFocusTargets = FocusedInputContext;
 
 unsafe fn accessible_system_caret_anchor(window: HWND) -> Option<CaretAnchor> {
     let accessible = accessible_system_caret_object(window)?;
@@ -1427,8 +1653,9 @@ unsafe fn anchor_matches_window(anchor: CaretAnchor, window: HWND) -> bool {
 unsafe fn foreground_focus_targets() -> ForegroundFocusTargets {
     let foreground = GetForegroundWindow();
     if foreground.is_null() {
-        return ForegroundFocusTargets {
+        return FocusedInputContext {
             foreground: null_mut(),
+            active: null_mut(),
             focus: null_mut(),
             caret: null_mut(),
             caret_rect: RECT::default(),
@@ -1439,8 +1666,9 @@ unsafe fn foreground_focus_targets() -> ForegroundFocusTargets {
     let mut process_id = 0u32;
     let thread_id = GetWindowThreadProcessId(foreground, &mut process_id);
     if thread_id == 0 {
-        return ForegroundFocusTargets {
+        return FocusedInputContext {
             foreground,
+            active: foreground,
             focus: null_mut(),
             caret: null_mut(),
             caret_rect: RECT::default(),
@@ -1451,8 +1679,9 @@ unsafe fn foreground_focus_targets() -> ForegroundFocusTargets {
     let mut info: GUITHREADINFO = zeroed();
     info.cbSize = size_of::<GUITHREADINFO>() as u32;
     if GetGUIThreadInfo(thread_id, &mut info) == FALSE {
-        return ForegroundFocusTargets {
+        return FocusedInputContext {
             foreground,
+            active: foreground,
             focus: null_mut(),
             caret: null_mut(),
             caret_rect: RECT::default(),
@@ -1460,8 +1689,13 @@ unsafe fn foreground_focus_targets() -> ForegroundFocusTargets {
         };
     }
 
-    ForegroundFocusTargets {
+    FocusedInputContext {
         foreground,
+        active: if info.hwndActive.is_null() {
+            foreground
+        } else {
+            info.hwndActive
+        },
         focus: info.hwndFocus,
         caret: info.hwndCaret,
         caret_rect: info.rcCaret,
@@ -1654,18 +1888,6 @@ fn scale_between_dpi(value: i32, from_dpi: u32, to_dpi: u32) -> i32 {
     (rounded / i64::from(from_dpi)).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
-unsafe fn is_console_like_window(window: HWND) -> bool {
-    let Some(class_name) = window_class_name(window) else {
-        return false;
-    };
-    is_console_like_class(&class_name)
-}
-
-unsafe fn is_classic_console_window(window: HWND) -> bool {
-    window_class_name(window)
-        .is_some_and(|class_name| class_name.eq_ignore_ascii_case("ConsoleWindowClass"))
-}
-
 fn is_console_like_class(class_name: &str) -> bool {
     matches!(
         class_name.to_ascii_lowercase().as_str(),
@@ -1747,8 +1969,7 @@ struct ExcelDialogCaretSearch {
     fallback: Option<CaretAnchor>,
 }
 
-unsafe fn excel_dialog_caret_anchor(targets: ForegroundFocusTargets) -> Option<CaretAnchor> {
-    let dialog = excel_dialog_root_for_targets(targets)?;
+unsafe fn excel_dialog_caret_anchor_in_dialog(dialog: HWND) -> Option<CaretAnchor> {
     let mut search = ExcelDialogCaretSearch::default();
     EnumChildWindows(
         dialog,
@@ -1759,10 +1980,22 @@ unsafe fn excel_dialog_caret_anchor(targets: ForegroundFocusTargets) -> Option<C
 }
 
 unsafe fn excel_dialog_root_for_targets(targets: ForegroundFocusTargets) -> Option<HWND> {
-    [targets.focus, targets.caret, targets.foreground]
+    let direct = [targets.focus, targets.caret, targets.foreground]
         .into_iter()
-        .find_map(|window| excel_dialog_root(window))
-        .or_else(|| excel_dialog_for_process(targets.process_id))
+        .find_map(|window| excel_dialog_root(window));
+    if direct.is_some() {
+        return direct;
+    }
+
+    // Excel can leave XLMAIN as the foreground window while its modeless
+    // Find/Replace dialog is active. Fall back to process-wide enumeration only
+    // when one of the current targets still belongs to an Excel host; otherwise
+    // ordinary applications would scan every top-level window on each probe.
+    [targets.foreground, targets.focus, targets.caret]
+        .into_iter()
+        .any(|window| is_excel_host_window(window))
+        .then(|| excel_dialog_for_process(targets.process_id))
+        .flatten()
 }
 
 unsafe fn excel_dialog_root(window: HWND) -> Option<HWND> {
@@ -1806,12 +2039,7 @@ unsafe fn excel_dialog_for_process(process_id: u32) -> Option<HWND> {
 }
 
 unsafe extern "system" fn enum_excel_dialog_window(window: HWND, parameter: LPARAM) -> BOOL {
-    if parameter == 0
-        || IsWindowEnabled(window) == FALSE
-        || IsWindowVisible(window) == FALSE
-        || !window_class_name(window)
-            .is_some_and(|class_name| is_excel_dialog_class(&class_name))
-    {
+    if parameter == 0 {
         return TRUE;
     }
 
@@ -1821,16 +2049,19 @@ unsafe extern "system" fn enum_excel_dialog_window(window: HWND, parameter: LPAR
     if process_id != search.process_id {
         return TRUE;
     }
+    if IsWindowEnabled(window) == FALSE
+        || IsWindowVisible(window) == FALSE
+        || !window_class_name(window)
+            .is_some_and(|class_name| is_excel_dialog_class(&class_name))
+    {
+        return TRUE;
+    }
 
     search.dialog = window;
     FALSE
 }
 
-unsafe fn excel_dialog_editor_bounds_anchor(
-    targets: ForegroundFocusTargets,
-    editor: HWND,
-) -> Option<CaretAnchor> {
-    excel_dialog_root_for_targets(targets)?;
+unsafe fn excel_dialog_editor_bounds_anchor(editor: HWND) -> Option<CaretAnchor> {
     if !window_class_name(editor).is_some_and(|class_name| {
         class_name.eq_ignore_ascii_case("EDTBX") || class_name.eq_ignore_ascii_case("Edit")
     }) {

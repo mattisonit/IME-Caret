@@ -27,7 +27,9 @@ fn main() {
 mod windows_app {
     use crate::assets::*;
     use crate::config::{Config, IndicatorPosition, RgbaColor};
-    use crate::editability::{CaretAnchor, EditabilityDetector, FocusedInputHost};
+    use crate::editability::{
+        CaretAnchor, EditabilityDetector, FocusedInputContext, FocusedInputHost,
+    };
     use crate::ime::{is_modern_shell_overlay_window, ImeEngine, ImeSnapshot, Validity};
     use crate::win::*;
     use std::ffi::{c_void, OsStr};
@@ -40,7 +42,7 @@ mod windows_app {
     use std::time::{Duration, Instant};
 
     const APP_NAME: &str = "IME Caret";
-    const APP_VERSION: &str = "2.1";
+    const APP_VERSION: &str = "2.2";
     const MAIN_CLASS: &str = "ImeCaret.MainWindow";
     const BADGE_CLASS: &str = "ImeCaret.BadgeWindow";
     const SETTINGS_CLASS: &str = "ImeCaret.SettingsWindow";
@@ -223,11 +225,16 @@ mod windows_app {
 
         badge_visible: bool,
         badge_kind: Option<ImeKind>,
-        badge_text: Vec<u16>,
+        badge_text: u16,
         badge_text_color: RgbaColor,
         badge_background_color: RgbaColor,
         badge_position: Option<(i32, i32)>,
         badge_size: Option<(i32, i32)>,
+        badge_monitor: HMONITOR,
+        badge_monitor_dpi: Option<u32>,
+        // True only while the window's retained layered surface matches the
+        // stored glyph, colors, size, and current display rendering settings.
+        badge_surface_valid: bool,
         cleaning_up: bool,
         shell_overlay_hwnd: HWND,
         shell_overlay_active: bool,
@@ -283,11 +290,14 @@ mod windows_app {
                 cleared_unknown: false,
                 badge_visible: false,
                 badge_kind: None,
-                badge_text: wide_without_null("A"),
+                badge_text: 'A' as u16,
                 badge_text_color: config.indicator_text_color,
                 badge_background_color: config.english_background_color,
                 badge_position: None,
                 badge_size: None,
+                badge_monitor: null_mut(),
+                badge_monitor_dpi: None,
+                badge_surface_valid: false,
                 cleaning_up: false,
                 shell_overlay_hwnd: null_mut(),
                 shell_overlay_active: false,
@@ -519,16 +529,21 @@ mod windows_app {
 
             // Mouse position and mouse cursor state are deliberately ignored.
             // The indicator follows only a positively identified editable caret.
-            let editability = self.editability_detector.focused_input();
+            let input_context = FocusedInputContext::capture();
+            let editability = self
+                .editability_detector
+                .focused_input_with_context(input_context);
             if !editability.accepts_text_input() {
                 self.clear_active_caret();
                 self.hide_badge();
                 return;
             }
 
-            let shell_overlay = self.active_shell_overlay_bounds();
-            let focused_host = self.focused_input_host_for_shell();
-            let snapshot = self.ime_engine.query(focused_host);
+            let shell_overlay = self.active_shell_overlay_bounds(input_context.foreground);
+            let focused_host = self.focused_input_host_for_shell(input_context);
+            let snapshot = self
+                .ime_engine
+                .query_with_context(focused_host, input_context);
             if snapshot.validity == Validity::Invalid {
                 self.clear_active_caret();
                 self.show_ime(
@@ -549,7 +564,7 @@ mod windows_app {
             };
             let Some(anchor) = self
                 .editability_detector
-                .focused_caret_anchor(console_cell_span)
+                .focused_caret_anchor_with_context(input_context, console_cell_span)
             else {
                 self.clear_active_caret();
                 self.hide_badge();
@@ -816,11 +831,15 @@ mod windows_app {
             }
 
             let (text, background_color) = match kind {
-                ImeKind::Korean => ("가", self.config.korean_background_color),
-                ImeKind::JapaneseHiragana => ("ひ", self.config.japanese_background_color),
-                ImeKind::JapaneseKatakana => ("カ", self.config.japanese_background_color),
-                ImeKind::English if caps => ("A", self.config.english_background_color),
-                ImeKind::English => ("a", self.config.english_background_color),
+                ImeKind::Korean => ('가' as u16, self.config.korean_background_color),
+                ImeKind::JapaneseHiragana => {
+                    ('ひ' as u16, self.config.japanese_background_color)
+                }
+                ImeKind::JapaneseKatakana => {
+                    ('カ' as u16, self.config.japanese_background_color)
+                }
+                ImeKind::English if caps => ('A' as u16, self.config.english_background_color),
+                ImeKind::English => ('a' as u16, self.config.english_background_color),
                 ImeKind::Unsupported => {
                     self.hide_badge();
                     return;
@@ -828,23 +847,22 @@ mod windows_app {
             };
             let text_color = self.config.indicator_text_color;
 
-            let next_text = wide_without_null(text);
             let appearance_changed = self.badge_kind != Some(kind)
-                || self.badge_text != next_text
+                || self.badge_text != text
                 || self.badge_text_color != text_color
                 || self.badge_background_color != background_color;
             if appearance_changed {
                 self.badge_kind = Some(kind);
-                self.badge_text = next_text;
+                self.badge_text = text;
                 self.badge_text_color = text_color;
                 self.badge_background_color = background_color;
+                self.badge_surface_valid = false;
             }
 
-            let dpi = monitor_dpi_at_point(POINT {
+            let dpi = self.badge_dpi_at_point(POINT {
                 x: anchor.x,
                 y: anchor.bottom,
-            })
-            .unwrap_or_else(|| window_dpi(GetForegroundWindow()));
+            });
             let badge_width = scale_for_dpi(CARET_INDICATOR_WIDTH, dpi);
             let badge_height = scale_for_dpi(CARET_INDICATOR_HEIGHT, dpi);
 
@@ -856,7 +874,15 @@ mod windows_app {
                 shell_overlay,
             );
             let size_changed = self.badge_size != Some((badge_width, badge_height));
-            let needs_render = !self.badge_visible || size_changed || appearance_changed;
+            if size_changed {
+                self.badge_surface_valid = false;
+            }
+
+            // ShowWindow(SW_HIDE) preserves a layered window's last surface.
+            // Only the first paint, a glyph/color change, or a size change
+            // invalidates it; a same-appearance re-show only needs Z-order and
+            // position restoration.
+            let needs_render = !self.badge_surface_valid;
             if needs_render {
                 if !render_layered_badge(
                     self.badge_hwnd,
@@ -864,16 +890,18 @@ mod windows_app {
                     y,
                     badge_width,
                     badge_height,
-                    &mut self.badge_text,
+                    self.badge_text,
                     self.badge_text_color,
                     self.badge_background_color,
                 ) {
+                    self.badge_surface_valid = false;
                     self.hide_badge();
                     return;
                 }
                 self.badge_position = Some((x, y));
                 self.badge_size = Some((badge_width, badge_height));
-            } else if self.badge_position != Some((x, y)) {
+                self.badge_surface_valid = true;
+            } else if !self.badge_visible || self.badge_position != Some((x, y)) {
                 SetWindowPos(
                     self.badge_hwnd,
                     HWND_TOPMOST,
@@ -905,8 +933,28 @@ mod windows_app {
             self.badge_visible = true;
         }
 
-        unsafe fn active_shell_overlay_bounds(&mut self) -> Option<RECT> {
-            let foreground = GetForegroundWindow();
+        unsafe fn badge_dpi_at_point(&mut self, point: POINT) -> u32 {
+            let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+            if !monitor.is_null() {
+                if monitor == self.badge_monitor {
+                    if let Some(dpi) = self.badge_monitor_dpi {
+                        return dpi;
+                    }
+                }
+
+                if let Some(dpi) = monitor_dpi(monitor) {
+                    self.badge_monitor = monitor;
+                    self.badge_monitor_dpi = Some(dpi);
+                    return dpi;
+                }
+            }
+
+            self.badge_monitor = monitor;
+            self.badge_monitor_dpi = None;
+            window_dpi(GetForegroundWindow())
+        }
+
+        unsafe fn active_shell_overlay_bounds(&mut self, foreground: HWND) -> Option<RECT> {
             if foreground != self.shell_overlay_hwnd {
                 self.shell_overlay_hwnd = foreground;
                 self.shell_overlay_active =
@@ -923,7 +971,10 @@ mod windows_app {
             visible_window_bounds(foreground)
         }
 
-        unsafe fn focused_input_host_for_shell(&mut self) -> FocusedInputHost {
+        unsafe fn focused_input_host_for_shell(
+            &mut self,
+            input_context: FocusedInputContext,
+        ) -> FocusedInputHost {
             if !self.shell_overlay_active {
                 return FocusedInputHost::default();
             }
@@ -939,7 +990,9 @@ mod windows_app {
                 return self.shell_focused_host;
             }
 
-            self.shell_focused_host = self.editability_detector.focused_input_host();
+            self.shell_focused_host = self
+                .editability_detector
+                .focused_input_host_with_context(input_context);
             self.shell_focused_host_tick = Some(now);
             WIN_EVENT_ALLOWED_HOST_PROCESS_ID
                 .store(self.shell_focused_host.process_id, Ordering::Release);
@@ -1511,6 +1564,8 @@ mod windows_app {
     }
 
     unsafe fn is_excel_find_replace_foreground() -> bool {
+        const EXCEL_DIALOG_PREFIX: &[u8] = b"bosa_sdm_xl";
+
         let foreground = GetForegroundWindow();
         if foreground.is_null() {
             return false;
@@ -1521,10 +1576,18 @@ mod windows_app {
             class_name.as_mut_ptr(),
             class_name.len() as i32,
         );
-        length > 0
-            && String::from_utf16_lossy(&class_name[..length as usize])
-                .to_ascii_lowercase()
-                .starts_with("bosa_sdm_xl")
+        if length < EXCEL_DIALOG_PREFIX.len() as i32 {
+            return false;
+        }
+
+        EXCEL_DIALOG_PREFIX
+            .iter()
+            .enumerate()
+            .all(|(index, expected)| {
+                let actual = class_name[index];
+                actual == u16::from(*expected)
+                    || actual == u16::from(expected.to_ascii_uppercase())
+            })
     }
 
     fn raw_keyboard_key_can_change_ime(virtual_key: i32) -> bool {
@@ -1879,6 +1942,9 @@ mod windows_app {
             WM_SETTINGCHANGE | WM_DISPLAYCHANGE => {
                 state.note_activity();
                 state.old_kind = None;
+                state.badge_monitor = null_mut();
+                state.badge_monitor_dpi = None;
+                state.badge_surface_valid = false;
                 state.editability_detector.invalidate_focus_cache();
                 state.refresh_from_active_caret();
                 state.reschedule_poll_timer();
@@ -2016,7 +2082,7 @@ mod windows_app {
         y: i32,
         width: i32,
         height: i32,
-        text: &mut [u16],
+        text: u16,
         text_color: RgbaColor,
         background_color: RgbaColor,
     ) -> bool {
@@ -2106,6 +2172,7 @@ mod windows_app {
             right: width,
             bottom: height,
         };
+        let mut text = [text];
         DrawTextW(
             memory_dc,
             text.as_mut_ptr(),
@@ -2214,9 +2281,9 @@ mod windows_app {
     }
 
     #[derive(Clone, Copy)]
-    struct SettingsPositionLayout {
+    struct SettingsFieldLayout {
         label: RECT,
-        combo: RECT,
+        control: RECT,
     }
 
     unsafe fn settings_window_size() -> (i32, i32) {
@@ -2280,47 +2347,27 @@ mod windows_app {
         }
     }
 
-    fn settings_position_layout(layout: SettingsLayout, y: i32) -> SettingsPositionLayout {
+    fn settings_field_layout(
+        layout: SettingsLayout,
+        y: i32,
+        control_width: i32,
+    ) -> SettingsFieldLayout {
         let content_right = layout.content_left.saturating_add(layout.content_width);
-        let combo_width = SETTINGS_POSITION_COMBO_WIDTH.min(
+        let control_width = control_width.min(
             layout
                 .content_width
                 .saturating_sub(SETTINGS_POSITION_CONTROL_GAP + 1),
         );
-        let combo_left = content_right.saturating_sub(combo_width);
-        SettingsPositionLayout {
+        let control_left = content_right.saturating_sub(control_width);
+        SettingsFieldLayout {
             label: RECT {
                 left: layout.content_left,
                 top: y,
-                right: combo_left.saturating_sub(SETTINGS_POSITION_CONTROL_GAP),
+                right: control_left.saturating_sub(SETTINGS_POSITION_CONTROL_GAP),
                 bottom: y.saturating_add(22),
             },
-            combo: RECT {
-                left: combo_left,
-                top: y.saturating_sub(3),
-                right: content_right,
-                bottom: y.saturating_add(22),
-            },
-        }
-    }
-
-    fn settings_color_layout(layout: SettingsLayout, y: i32) -> SettingsPositionLayout {
-        let content_right = layout.content_left.saturating_add(layout.content_width);
-        let edit_width = SETTINGS_COLOR_EDIT_WIDTH.min(
-            layout
-                .content_width
-                .saturating_sub(SETTINGS_POSITION_CONTROL_GAP + 1),
-        );
-        let edit_left = content_right.saturating_sub(edit_width);
-        SettingsPositionLayout {
-            label: RECT {
-                left: layout.content_left,
-                top: y,
-                right: edit_left.saturating_sub(SETTINGS_POSITION_CONTROL_GAP),
-                bottom: y.saturating_add(22),
-            },
-            combo: RECT {
-                left: edit_left,
+            control: RECT {
+                left: control_left,
                 top: y.saturating_sub(3),
                 right: content_right,
                 bottom: y.saturating_add(22),
@@ -2406,7 +2453,8 @@ mod windows_app {
         }
 
         y += 5;
-        let position_layout = settings_position_layout(layout, y);
+        let position_layout =
+            settings_field_layout(layout, y, SETTINGS_POSITION_COMBO_WIDTH);
         create_control(
             state,
             hwnd,
@@ -2427,9 +2475,9 @@ mod windows_app {
             "COMBOBOX",
             "",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_HASSTRINGS,
-            position_layout.combo.left,
-            position_layout.combo.top,
-            position_layout.combo.right - position_layout.combo.left,
+            position_layout.control.left,
+            position_layout.control.top,
+            position_layout.control.right - position_layout.control.left,
             120,
             CTRL_INDICATOR_POSITION,
             font,
@@ -2471,7 +2519,7 @@ mod windows_app {
             ),
         ];
         for (id, label, color) in color_fields {
-            let field_layout = settings_color_layout(layout, y);
+            let field_layout = settings_field_layout(layout, y, SETTINGS_COLOR_EDIT_WIDTH);
             create_control(
                 state,
                 hwnd,
@@ -2496,10 +2544,10 @@ mod windows_app {
                     | WS_BORDER
                     | ES_UPPERCASE
                     | ES_AUTOHSCROLL,
-                field_layout.combo.left,
-                field_layout.combo.top,
-                field_layout.combo.right - field_layout.combo.left,
-                field_layout.combo.bottom - field_layout.combo.top,
+                field_layout.control.left,
+                field_layout.control.top,
+                field_layout.control.right - field_layout.control.left,
+                field_layout.control.bottom - field_layout.control.top,
                 id,
                 font,
             );
@@ -2895,8 +2943,7 @@ mod windows_app {
         if dpi == 0 { DEFAULT_DPI } else { dpi }
     }
 
-    unsafe fn monitor_dpi_at_point(point: POINT) -> Option<u32> {
-        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+    unsafe fn monitor_dpi(monitor: HMONITOR) -> Option<u32> {
         if monitor.is_null() {
             return None;
         }
@@ -3377,8 +3424,13 @@ mod windows_app {
             let visual_group_top = layout.group.top + SETTINGS_GROUP_CAPTION_VISUAL_INSET;
             let first_control_top = visual_group_top + SETTINGS_CONTENT_VERTICAL_MARGIN;
             let position_y = first_control_top + 4 * 29 + 5;
-            let position = settings_position_layout(layout, position_y);
-            let last_color = settings_color_layout(layout, position_y + 4 * 29);
+            let position =
+                settings_field_layout(layout, position_y, SETTINGS_POSITION_COMBO_WIDTH);
+            let last_color = settings_field_layout(
+                layout,
+                position_y + 4 * 29,
+                SETTINGS_COLOR_EDIT_WIDTH,
+            );
 
             assert_eq!(layout.group.left, SETTINGS_HORIZONTAL_MARGIN);
             assert_eq!(
@@ -3402,23 +3454,23 @@ mod windows_app {
                 SETTINGS_CONTENT_INSET
             );
             assert_eq!(
-                layout.group.right - position.combo.right,
+                layout.group.right - position.control.right,
                 SETTINGS_CONTENT_INSET
             );
             assert_eq!(
-                position.combo.left - position.label.right,
+                position.control.left - position.label.right,
                 SETTINGS_POSITION_CONTROL_GAP
             );
             assert_eq!(
                 first_control_top - visual_group_top,
                 layout.group.bottom - last_color.label.bottom
             );
-            assert_eq!(position.combo.right, last_color.combo.right);
+            assert_eq!(position.control.right, last_color.control.right);
         }
 
         #[test]
         fn tray_tooltip_contains_program_name_and_version() {
-            assert_eq!(tray_tooltip_text(), "IME Caret 2.1");
+            assert_eq!(tray_tooltip_text(), "IME Caret 2.2");
         }
 
         #[test]
