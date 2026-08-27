@@ -742,6 +742,7 @@ extern "system" {
     pub fn SetWindowLongW(hWnd: HWND, nIndex: i32, dwNewLong: LONG) -> LONG;
 
     pub fn GetForegroundWindow() -> HWND;
+    pub fn GetCursorPos(lpPoint: *mut POINT) -> BOOL;
     pub fn GetGUIThreadInfo(idThread: DWORD, pgui: *mut GUITHREADINFO) -> BOOL;
     pub fn GetWindowThreadProcessId(hWnd: HWND, lpdwProcessId: *mut DWORD) -> DWORD;
     pub fn GetParent(hWnd: HWND) -> HWND;

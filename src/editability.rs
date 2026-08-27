@@ -12,6 +12,8 @@ const MAX_UIA_PARENT_DEPTH: usize = 12;
 const MAX_UIA_CARET_PARENT_DEPTH: usize = 12;
 const MAX_UIA_CARET_DESCENDANT_DEPTH: usize = 4;
 const MAX_UIA_CARET_DESCENDANT_NODES: usize = 64;
+const MAX_SCOPED_TOP_INPUT_DESCENDANT_DEPTH: usize = 8;
+const MAX_SCOPED_TOP_INPUT_DESCENDANT_NODES: usize = 512;
 const CLASS_NAME_CAPACITY: usize = 128;
 const CONTROL_MESSAGE_TIMEOUT_MS: u32 = 25;
 
@@ -99,6 +101,8 @@ const TEXT_UNIT_CHARACTER: i32 = 0;
 const MAX_DIRECT_CARET_RECT_WIDTH: f64 = 4.0;
 const MAX_CHARACTER_RECT_WIDTH: f64 = 64.0;
 const ELEMENT_ANCHOR_TOLERANCE: f64 = 6.0;
+const MIN_TRANSIENT_TOP_EDITABLE_WIDTH: f64 = 80.0;
+const MAX_TRANSIENT_TOP_EDITABLE_HEIGHT: f64 = 160.0;
 const VT_ARRAY_R8: u16 = 0x2000 | 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -196,6 +200,14 @@ struct CachedOutlookCaretAnchor {
 }
 
 #[derive(Clone, Copy)]
+struct CachedTaskManagerCaretAnchor {
+    foreground: HWND,
+    focus: HWND,
+    bridge_bounds: (i32, i32, i32, i32),
+    anchor: CaretAnchor,
+}
+
+#[derive(Clone, Copy)]
 struct ForegroundWindowProfile {
     window: HWND,
     console_like: bool,
@@ -204,6 +216,7 @@ struct ForegroundWindowProfile {
     chromium: bool,
     office_uia_preferred: bool,
     word_frame: bool,
+    transient_top_input_host: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -276,13 +289,16 @@ fn evidence_accepts_caret_probe(
 pub struct EditabilityDetector {
     automation: *mut c_void,
     raw_view_walker: *mut c_void,
+    taskbar_input_indicator_element: *mut c_void,
     co_initialized: bool,
     last_focus_probe: Option<CachedFocusProbe>,
     focused_element_cache: Option<CachedFocusedElement>,
     outlook_editability_cache: Option<CachedOutlookEditability>,
     outlook_caret_anchor_cache: Option<CachedOutlookCaretAnchor>,
+    task_manager_caret_anchor_cache: Option<CachedTaskManagerCaretAnchor>,
     foreground_window_profile: Option<ForegroundWindowProfile>,
     refresh_probe_cache: Option<CachedRefreshProbe>,
+    last_caret_requires_topmost_reassert: bool,
     attached_console_pid: u32,
 }
 
@@ -318,13 +334,16 @@ impl EditabilityDetector {
         Self {
             automation,
             raw_view_walker,
+            taskbar_input_indicator_element: null_mut(),
             co_initialized,
             last_focus_probe: None,
             focused_element_cache: None,
             outlook_editability_cache: None,
             outlook_caret_anchor_cache: None,
+            task_manager_caret_anchor_cache: None,
             foreground_window_profile: None,
             refresh_probe_cache: None,
+            last_caret_requires_topmost_reassert: false,
             attached_console_pid: 0,
         }
     }
@@ -349,6 +368,7 @@ impl EditabilityDetector {
         self.outlook_caret_anchor_cache = None;
         self.foreground_window_profile = None;
         self.refresh_probe_cache = None;
+        self.last_caret_requires_topmost_reassert = false;
         unsafe {
             self.clear_focused_element_cache();
         }
@@ -371,6 +391,7 @@ impl EditabilityDetector {
             chromium: is_chromium_widget_class(&class_name),
             office_uia_preferred: is_office_uia_preferred_caret_class(&class_name),
             word_frame: class_name.eq_ignore_ascii_case("OpusApp"),
+            transient_top_input_host: is_transient_top_input_host_class(&class_name),
         };
         self.foreground_window_profile = Some(profile);
         profile
@@ -536,7 +557,60 @@ impl EditabilityDetector {
         context: FocusedInputContext,
         console_cell_span: i32,
     ) -> Option<CaretAnchor> {
-        unsafe { self.focused_caret_anchor_unsafe(context, console_cell_span.clamp(1, 2)) }
+        let anchor = unsafe {
+            self.focused_caret_anchor_unsafe(context, console_cell_span.clamp(1, 2))
+        };
+        self.last_caret_requires_topmost_reassert = anchor.is_some_and(|anchor| {
+            unsafe { anchor_is_near_top_of_window(anchor, context.foreground) }
+        });
+        anchor
+    }
+
+    /// Returns whether the last caret belongs to an upper command/search
+    /// surface that may finish its own Z-order activation after focus changes.
+    pub fn caret_needs_topmost_reassert(&self) -> bool {
+        self.last_caret_requires_topmost_reassert
+    }
+
+    /// Reads the mode published by Windows' own taskbar input indicator. This
+    /// is a narrow fallback for elevated modern input hosts whose per-context
+    /// TSF/IMM state is unavailable to this ordinary-privilege process.
+    pub fn taskbar_korean_input_mode(&mut self) -> Option<bool> {
+        unsafe { self.taskbar_korean_input_mode_unsafe() }
+    }
+
+    unsafe fn taskbar_korean_input_mode_unsafe(&mut self) -> Option<bool> {
+        if self.automation.is_null() || self.raw_view_walker.is_null() {
+            return None;
+        }
+        if !self.taskbar_input_indicator_element.is_null() {
+            if let Some(mode) = taskbar_input_mode_from_element(self.taskbar_input_indicator_element)
+            {
+                return Some(mode);
+            }
+            release_com(self.taskbar_input_indicator_element);
+            self.taskbar_input_indicator_element = null_mut();
+        }
+
+        let class_name: Vec<u16> = "Shell_TrayWnd".encode_utf16().chain(Some(0)).collect();
+        let taskbar = FindWindowW(class_name.as_ptr(), null());
+        if taskbar.is_null() {
+            return None;
+        }
+        let Some(element) = element_from_handle(self.automation, taskbar) else {
+            return None;
+        };
+
+        let mut remaining = 128;
+        let indicator = find_taskbar_input_indicator(
+            self.raw_view_walker,
+            element,
+            10,
+            &mut remaining,
+        );
+        release_com(element);
+        self.taskbar_input_indicator_element = indicator?;
+        taskbar_input_mode_from_element(self.taskbar_input_indicator_element)
     }
 
     unsafe fn focused_caret_anchor_unsafe(
@@ -595,6 +669,7 @@ impl EditabilityDetector {
                 targets,
                 console_like,
                 force_exact_uia_geometry,
+                foreground_profile.transient_top_input_host,
             ) {
                 CaretProbeResult::Found(anchor) => Some(anchor),
                 CaretProbeResult::Suppress | CaretProbeResult::Missing => None,
@@ -607,7 +682,7 @@ impl EditabilityDetector {
         // classic attachment must use their text provider instead of falling
         // through to that stale GUI-thread caret.
         if console_like {
-            return match self.uia_focused_caret_anchor(targets, true, false) {
+            return match self.uia_focused_caret_anchor(targets, true, false, false) {
                 CaretProbeResult::Found(anchor) => Some(anchor),
                 CaretProbeResult::Suppress | CaretProbeResult::Missing => None,
             };
@@ -635,7 +710,7 @@ impl EditabilityDetector {
                 return Some(anchor);
             }
             if let CaretProbeResult::Found(anchor) =
-                self.uia_focused_caret_anchor(targets, false, false)
+                self.uia_focused_caret_anchor(targets, false, false, false)
             {
                 return Some(anchor);
             }
@@ -699,7 +774,7 @@ impl EditabilityDetector {
         // focused UI Automation text range, then the Office accessibility
         // caret, and do not fall through to stale Win32 geometry.
         if office_uia_preferred {
-            match self.uia_focused_caret_anchor(targets, false, false) {
+            match self.uia_focused_caret_anchor(targets, false, false, false) {
                 CaretProbeResult::Found(anchor) => return Some(anchor),
                 CaretProbeResult::Suppress => return None,
                 CaretProbeResult::Missing => {}
@@ -711,7 +786,12 @@ impl EditabilityDetector {
             return Some(anchor);
         }
 
-        match self.uia_focused_caret_anchor(targets, false, false) {
+        match self.uia_focused_caret_anchor(
+            targets,
+            false,
+            false,
+            foreground_profile.transient_top_input_host,
+        ) {
             CaretProbeResult::Found(anchor) => Some(anchor),
             CaretProbeResult::Suppress | CaretProbeResult::Missing => None,
         }
@@ -1102,6 +1182,10 @@ impl EditabilityDetector {
         let Some(element) = self.focused_element_for_targets(targets) else {
             return Editability::Unknown;
         };
+        let transient_top_foreground = window_class_name(targets.foreground)
+            .filter(|class_name| is_transient_top_input_host_class(class_name))
+            .map(|_| targets.foreground)
+            .unwrap_or(null_mut());
 
         // Chromium can report focus on an anonymous wrapper while the actual
         // search/edit element is a nearby descendant. Probe only a small raw
@@ -1114,13 +1198,14 @@ impl EditabilityDetector {
                 element,
                 MAX_UIA_CARET_DESCENDANT_DEPTH,
                 &mut remaining,
+                transient_top_foreground,
             ) {
                 release_com(element);
                 return Editability::Editable;
             }
         }
 
-        self.classify_element_chain(element)
+        self.classify_element_chain(element, transient_top_foreground)
     }
 
     unsafe fn uia_focused_caret_anchor(
@@ -1128,6 +1213,7 @@ impl EditabilityDetector {
         targets: ForegroundFocusTargets,
         console_like: bool,
         exact_geometry_only: bool,
+        allow_transient_top_bounds: bool,
     ) -> CaretProbeResult {
         if self.automation.is_null() {
             return CaretProbeResult::Missing;
@@ -1140,18 +1226,29 @@ impl EditabilityDetector {
         let Some(mut element) = self.focused_element_for_targets(targets) else {
             return CaretProbeResult::Missing;
         };
-        let mut editable_bounds_fallback = None;
+        let transient_top_foreground = if allow_transient_top_bounds {
+            targets.foreground
+        } else {
+            null_mut()
+        };
 
         let initial_evidence = inspect_element(element);
-        if evidence_accepts_caret_probe(initial_evidence, console_like, exact_geometry_only) {
+        let initial_transient_fallback =
+            transient_top_editable_element_caret_anchor(element, transient_top_foreground);
+        let mut editable_bounds_fallback = initial_transient_fallback;
+        if evidence_accepts_caret_probe(initial_evidence, console_like, exact_geometry_only)
+            || initial_transient_fallback.is_some()
+        {
             match probe_caret_anchor_from_uia_element(element, exact_geometry_only) {
                 CaretProbeResult::Found(point) => {
                     release_com(element);
                     return CaretProbeResult::Found(point);
                 }
                 CaretProbeResult::Suppress => {
-                    release_com(element);
-                    return CaretProbeResult::Suppress;
+                    if initial_transient_fallback.is_none() {
+                        release_com(element);
+                        return CaretProbeResult::Suppress;
+                    }
                 }
                 CaretProbeResult::Missing => {}
             }
@@ -1177,6 +1274,7 @@ impl EditabilityDetector {
                     MAX_UIA_CARET_DESCENDANT_DEPTH,
                     &mut remaining,
                     exact_geometry_only,
+                    transient_top_foreground,
                 )
             };
             match descendant {
@@ -1185,8 +1283,10 @@ impl EditabilityDetector {
                     return CaretProbeResult::Found(point);
                 }
                 CaretProbeResult::Suppress => {
-                    release_com(element);
-                    return CaretProbeResult::Suppress;
+                    if editable_bounds_fallback.is_none() {
+                        release_com(element);
+                        return CaretProbeResult::Suppress;
+                    }
                 }
                 CaretProbeResult::Missing => {}
             }
@@ -1194,15 +1294,18 @@ impl EditabilityDetector {
 
         let mut initial_element = true;
         for _ in 0..MAX_UIA_CARET_PARENT_DEPTH {
-            let evidence = if initial_element {
-                initial_evidence
-            } else {
-                inspect_element(element)
-            };
-            if !initial_element
-                && evidence_accepts_caret_probe(evidence, console_like, exact_geometry_only)
+            if !self.raw_view_walker.is_null()
+                && is_scoped_top_input_container(element, targets.foreground)
             {
-                match probe_caret_anchor_from_uia_element(element, exact_geometry_only) {
+                let mut remaining = MAX_SCOPED_TOP_INPUT_DESCENDANT_NODES;
+                match descendant_editable_caret_anchor(
+                    self.raw_view_walker,
+                    element,
+                    MAX_SCOPED_TOP_INPUT_DESCENDANT_DEPTH,
+                    &mut remaining,
+                    exact_geometry_only,
+                    transient_top_foreground,
+                ) {
                     CaretProbeResult::Found(point) => {
                         release_com(element);
                         return CaretProbeResult::Found(point);
@@ -1213,9 +1316,55 @@ impl EditabilityDetector {
                     }
                     CaretProbeResult::Missing => {}
                 }
+                if is_task_manager_top_input_container(element, targets.foreground) {
+                    if let Some(anchor) =
+                        task_manager_top_input_bridge_caret_anchor(
+                            self.automation,
+                            self.raw_view_walker,
+                            &mut self.task_manager_caret_anchor_cache,
+                            element,
+                            targets,
+                        )
+                    {
+                        release_com(element);
+                        return CaretProbeResult::Found(anchor);
+                    }
+                }
+            }
+            let evidence = if initial_element {
+                initial_evidence
+            } else {
+                inspect_element(element)
+            };
+            let transient_fallback =
+                transient_top_editable_element_caret_anchor(element, transient_top_foreground);
+            let accepts_caret = evidence_accepts_caret_probe(
+                evidence,
+                console_like,
+                exact_geometry_only,
+            ) || transient_fallback.is_some();
+            if !initial_element && accepts_caret {
+                match probe_caret_anchor_from_uia_element(element, exact_geometry_only) {
+                    CaretProbeResult::Found(point) => {
+                        release_com(element);
+                        return CaretProbeResult::Found(point);
+                    }
+                    CaretProbeResult::Suppress => {
+                        if transient_fallback.is_none() {
+                            release_com(element);
+                            return CaretProbeResult::Suppress;
+                        }
+                        if editable_bounds_fallback.is_none() {
+                            editable_bounds_fallback = transient_fallback;
+                        }
+                    }
+                    CaretProbeResult::Missing => {}
+                }
             }
 
-            if evidence_accepts_caret_probe(evidence, false, exact_geometry_only) {
+            if evidence_accepts_caret_probe(evidence, false, exact_geometry_only)
+                || transient_fallback.is_some()
+            {
                 // Chromium may put the TextPattern provider on a child node of
                 // the focused search box rather than on the focused element or
                 // one of its ancestors. YouTube's search field is a common
@@ -1226,13 +1375,16 @@ impl EditabilityDetector {
                     && initial_subtree_editable_only == exact_geometry_only;
                 if !self.raw_view_walker.is_null() && !initial_subtree_already_probed {
                     let mut remaining = MAX_UIA_CARET_DESCENDANT_NODES;
-                    let descendant = if exact_geometry_only {
+                    let descendant = if exact_geometry_only
+                        || !transient_top_foreground.is_null()
+                    {
                         descendant_editable_caret_anchor(
                             self.raw_view_walker,
                             element,
                             MAX_UIA_CARET_DESCENDANT_DEPTH,
                             &mut remaining,
-                            true,
+                            exact_geometry_only,
+                            transient_top_foreground,
                         )
                     } else {
                         descendant_caret_anchor(
@@ -1249,15 +1401,23 @@ impl EditabilityDetector {
                             return CaretProbeResult::Found(point);
                         }
                         CaretProbeResult::Suppress => {
-                            release_com(element);
-                            return CaretProbeResult::Suppress;
+                            if editable_bounds_fallback.is_none()
+                                && transient_fallback.is_none()
+                            {
+                                release_com(element);
+                                return CaretProbeResult::Suppress;
+                            }
+                            if editable_bounds_fallback.is_none() {
+                                editable_bounds_fallback = transient_fallback;
+                            }
                         }
                         CaretProbeResult::Missing => {}
                     }
                 }
 
                 if editable_bounds_fallback.is_none() {
-                    editable_bounds_fallback = empty_editable_element_caret_anchor(element);
+                    editable_bounds_fallback = empty_editable_element_caret_anchor(element)
+                        .or(transient_fallback);
                 }
             }
 
@@ -1278,11 +1438,47 @@ impl EditabilityDetector {
             .unwrap_or(CaretProbeResult::Missing)
     }
 
-    unsafe fn classify_element_chain(&self, mut element: *mut c_void) -> Editability {
+    unsafe fn classify_element_chain(
+        &self,
+        mut element: *mut c_void,
+        foreground: HWND,
+    ) -> Editability {
         let mut saw_read_only = false;
         let mut saw_selectable_text = false;
         let mut saw_code_like_text = false;
         for _ in 0..MAX_UIA_PARENT_DEPTH {
+            // VS Code keeps accessibility focus on the selected Quick Open
+            // result while keyboard input still belongs to an Edit sibling.
+            // Task Manager similarly focuses its native InputSite while the
+            // writable search provider lives below the enclosing top bridge.
+            // Search descendants only inside these narrowly identified input
+            // containers; never scan an application's full document tree.
+            if !self.raw_view_walker.is_null()
+                && is_scoped_top_input_container(element, foreground)
+            {
+                let mut remaining = MAX_SCOPED_TOP_INPUT_DESCENDANT_NODES;
+                if descendant_contains_editable(
+                    self.raw_view_walker,
+                    element,
+                    MAX_SCOPED_TOP_INPUT_DESCENDANT_DEPTH,
+                    &mut remaining,
+                    foreground,
+                ) {
+                    release_com(element);
+                    return Editability::Editable;
+                }
+                // These containers are reached only while their descendant
+                // owns accessibility focus. VS Code uses aria-activedescendant
+                // on a result row, and Task Manager exposes only its native
+                // InputSite, so neither provider is required to publish a
+                // writable ValuePattern on the focused node itself.
+                release_com(element);
+                return Editability::Editable;
+            }
+            if transient_top_editable_element_caret_anchor(element, foreground).is_some() {
+                release_com(element);
+                return Editability::Editable;
+            }
             match inspect_element(element) {
                 NodeEvidence::EditableField if !saw_code_like_text => {
                     release_com(element);
@@ -1534,6 +1730,10 @@ impl Drop for EditabilityDetector {
         unsafe {
             self.detach_console();
             self.clear_focused_element_cache();
+            if !self.taskbar_input_indicator_element.is_null() {
+                release_com(self.taskbar_input_indicator_element);
+                self.taskbar_input_indicator_element = null_mut();
+            }
             if !self.raw_view_walker.is_null() {
                 release_com(self.raw_view_walker);
                 self.raw_view_walker = null_mut();
@@ -1897,13 +2097,20 @@ fn is_console_like_class(class_name: &str) -> bool {
 
 fn is_uia_preferred_caret_class(class_name: &str) -> bool {
     let normalized = class_name.to_ascii_lowercase();
-    normalized.starts_with("chrome_widgetwin_") || normalized == "mozillawindowclass"
+    normalized.starts_with("chrome_widgetwin_")
+        || normalized == "mozillawindowclass"
+        || normalized == "taskmanagerwindow"
 }
 
 fn is_chromium_widget_class(class_name: &str) -> bool {
     class_name
         .to_ascii_lowercase()
         .starts_with("chrome_widgetwin_")
+}
+
+fn is_transient_top_input_host_class(class_name: &str) -> bool {
+    is_chromium_widget_class(class_name)
+        || class_name.eq_ignore_ascii_case("TaskManagerWindow")
 }
 
 fn is_office_uia_preferred_caret_class(class_name: &str) -> bool {
@@ -2333,6 +2540,169 @@ fn is_text_entry_aria_role(role: &str) -> bool {
         .any(|token| matches!(token, "textbox" | "searchbox" | "spinbutton" | "combobox"))
 }
 
+unsafe fn is_scoped_top_input_container(element: *mut c_void, foreground: HWND) -> bool {
+    let class_name = property_string(element, UIA_CLASS_NAME_PROPERTY_ID).unwrap_or_default();
+    if class_name
+        .split_ascii_whitespace()
+        .any(|token| token.eq_ignore_ascii_case("quick-input-widget"))
+    {
+        return true;
+    }
+
+    is_task_manager_top_input_container(element, foreground)
+}
+
+unsafe fn is_task_manager_top_input_container(element: *mut c_void, foreground: HWND) -> bool {
+    let class_name = property_string(element, UIA_CLASS_NAME_PROPERTY_ID).unwrap_or_default();
+    if !class_name.eq_ignore_ascii_case("Windows.UI.Composition.DesktopWindowContentBridge")
+        || !window_class_name(foreground)
+            .is_some_and(|class| class.eq_ignore_ascii_case("TaskManagerWindow"))
+    {
+        return false;
+    }
+
+    property_bounding_rect(element).is_some_and(|rect| {
+        rect.iter().all(|value| value.is_finite())
+            && rect[2] >= MIN_TRANSIENT_TOP_EDITABLE_WIDTH
+            && rect[3] > 0.0
+            && rect[3] <= MAX_TRANSIENT_TOP_EDITABLE_HEIGHT
+            && editable_element_caret_anchor(rect)
+                .is_some_and(|anchor| anchor_is_near_top_of_window(anchor, foreground))
+    })
+}
+
+unsafe fn task_manager_top_input_bridge_caret_anchor(
+    automation: *mut c_void,
+    walker: *mut c_void,
+    cache: &mut Option<CachedTaskManagerCaretAnchor>,
+    element: *mut c_void,
+    targets: ForegroundFocusTargets,
+) -> Option<CaretAnchor> {
+    if !is_task_manager_top_input_container(element, targets.foreground) {
+        return None;
+    }
+    let rect = property_bounding_rect(element)?;
+    let left = rect[0];
+    let right = rect[0] + rect[2];
+    let bounds = (
+        left.round() as i32,
+        rect[1].round() as i32,
+        right.round() as i32,
+        (rect[1] + rect[3]).round() as i32,
+    );
+
+    // Hit-test the point that activated the search box. Even when Task
+    // Manager's focused UIA element stops at the native InputSite, a point
+    // query can still return the underlying SearchBox provider on systems
+    // where that provider is accessible.
+    let mut cursor = POINT::default();
+    if !automation.is_null()
+        && GetCursorPos(&mut cursor) != FALSE
+        && cursor.x >= bounds.0
+        && cursor.x <= bounds.2
+        && cursor.y >= bounds.1
+        && cursor.y <= bounds.3
+    {
+        if let Some(anchor) = task_manager_search_hit_caret_anchor(
+            automation,
+            walker,
+            cursor,
+            targets.foreground,
+        ) {
+            *cache = Some(CachedTaskManagerCaretAnchor {
+                foreground: targets.foreground,
+                focus: targets.focus,
+                bridge_bounds: bounds,
+                anchor,
+            });
+            return Some(anchor);
+        }
+    }
+
+    if let Some(cached) = cache.as_ref().filter(|cached| {
+        cached.foreground == targets.foreground
+            && cached.focus == targets.focus
+            && cached.bridge_bounds == bounds
+    }) {
+        return Some(cached.anchor);
+    }
+
+    // On an elevated Task Manager the inner provider is hidden by UI
+    // privilege isolation. The SearchBox is centered against the Task Manager
+    // frame rather than against this narrower title bridge. Derive its empty
+    // input position from the frame center and DPI-scaled SearchBox metrics.
+    let dpi = GetDpiForWindow(targets.foreground).max(96) as f64;
+    let scale = dpi / 96.0;
+    let mut foreground_rect = RECT::default();
+    let frame_center = if GetWindowRect(targets.foreground, &mut foreground_rect) != FALSE {
+        (f64::from(foreground_rect.left) + f64::from(foreground_rect.right)) / 2.0
+    } else {
+        left + rect[2] / 2.0
+    };
+    let search_width = (480.0 * scale).min(rect[2]);
+    let search_left = frame_center - search_width / 2.0;
+    let text_inset = (32.0 * scale).clamp(24.0, 64.0);
+    let x = (search_left + text_inset).min(right - 4.0);
+    let top = rect[1] + 2.0;
+    let bottom = (rect[1] + rect[3] - 2.0).max(top + 1.0);
+    let anchor = CaretAnchor {
+        x: x.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32,
+        top: top.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32,
+        bottom: bottom
+            .round()
+            .clamp(i32::MIN as f64, i32::MAX as f64) as i32,
+    };
+    *cache = Some(CachedTaskManagerCaretAnchor {
+        foreground: targets.foreground,
+        focus: targets.focus,
+        bridge_bounds: bounds,
+        anchor,
+    });
+    Some(anchor)
+}
+
+unsafe fn task_manager_search_hit_caret_anchor(
+    automation: *mut c_void,
+    walker: *mut c_void,
+    point: POINT,
+    foreground: HWND,
+) -> Option<CaretAnchor> {
+    let mut element = element_from_point(automation, point)?;
+    let mut fallback = None;
+    let mut foreground_process_id = 0;
+    GetWindowThreadProcessId(foreground, &mut foreground_process_id);
+    for _ in 0..=6 {
+        let same_process = property_i32(element, UIA_PROCESS_ID_PROPERTY_ID)
+            .map(|process_id| process_id as u32 == foreground_process_id)
+            .unwrap_or(false);
+        let evidence = inspect_element(element);
+        if same_process && evidence_accepts_caret_probe(evidence, false, false) {
+            if let CaretProbeResult::Found(anchor) =
+                probe_caret_anchor_from_uia_element(element, false)
+            {
+                release_com(element);
+                return Some(anchor);
+            }
+            if fallback.is_none() {
+                fallback = property_bounding_rect(element)
+                    .and_then(editable_element_caret_anchor)
+                    .filter(|anchor| anchor_is_near_top_of_window(*anchor, foreground));
+            }
+        }
+
+        if walker.is_null() {
+            break;
+        }
+        let Some(parent) = tree_walker_parent(walker, element) else {
+            break;
+        };
+        release_com(element);
+        element = parent;
+    }
+    release_com(element);
+    fallback
+}
+
 fn text_entry_role_accepts_focus(
     has_keyboard_focus: Option<bool>,
     keyboard_focusable: Option<bool>,
@@ -2345,6 +2715,30 @@ unsafe fn get_focused_element(automation: *mut c_void) -> Option<*mut c_void> {
     let method: Method = transmute(com_method_address(automation, 8)?);
     let mut element = null_mut();
     let result = method(automation, &mut element);
+    if result >= 0 && !element.is_null() {
+        Some(element)
+    } else {
+        None
+    }
+}
+
+unsafe fn element_from_point(automation: *mut c_void, point: POINT) -> Option<*mut c_void> {
+    type Method = unsafe extern "system" fn(*mut c_void, POINT, *mut *mut c_void) -> HRESULT;
+    let method: Method = transmute(com_method_address(automation, 7)?);
+    let mut element = null_mut();
+    let result = method(automation, point, &mut element);
+    if result >= 0 && !element.is_null() {
+        Some(element)
+    } else {
+        None
+    }
+}
+
+unsafe fn element_from_handle(automation: *mut c_void, window: HWND) -> Option<*mut c_void> {
+    type Method = unsafe extern "system" fn(*mut c_void, HWND, *mut *mut c_void) -> HRESULT;
+    let method: Method = transmute(com_method_address(automation, 6)?);
+    let mut element = null_mut();
+    let result = method(automation, window, &mut element);
     if result >= 0 && !element.is_null() {
         Some(element)
     } else {
@@ -2600,11 +2994,64 @@ unsafe fn descendant_contains_matching_anchor(
     false
 }
 
+unsafe fn find_taskbar_input_indicator(
+    walker: *mut c_void,
+    parent: *mut c_void,
+    depth: usize,
+    remaining: &mut usize,
+) -> Option<*mut c_void> {
+    if depth == 0 || *remaining == 0 {
+        return None;
+    }
+    let Some(mut child) = tree_walker_first_child(walker, parent) else {
+        return None;
+    };
+    loop {
+        *remaining = (*remaining).saturating_sub(1);
+        if taskbar_input_mode_from_element(child).is_some() {
+            return Some(child);
+        }
+
+        if *remaining > 0 {
+            if let Some(indicator) =
+                find_taskbar_input_indicator(walker, child, depth - 1, remaining)
+            {
+                release_com(child);
+                return Some(indicator);
+            }
+        }
+
+        let next = tree_walker_next_sibling(walker, child);
+        release_com(child);
+        let Some(next) = next else {
+            break;
+        };
+        child = next;
+        if *remaining == 0 {
+            release_com(child);
+            break;
+        }
+    }
+    None
+}
+
+unsafe fn taskbar_input_mode_from_element(element: *mut c_void) -> Option<bool> {
+    let name = property_string(element, UIA_NAME_PROPERTY_ID)?.to_ascii_lowercase();
+    if name.contains("한국어 입력 모드") || name.contains("korean input mode") {
+        Some(true)
+    } else if name.contains("영어 입력 모드") || name.contains("english input mode") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 unsafe fn descendant_contains_editable(
     walker: *mut c_void,
     parent: *mut c_void,
     depth: usize,
     remaining: &mut usize,
+    transient_top_foreground: HWND,
 ) -> bool {
     if depth == 0 || *remaining == 0 {
         return false;
@@ -2618,12 +3065,25 @@ unsafe fn descendant_contains_editable(
         if matches!(
             inspect_element(child),
             NodeEvidence::EditableField | NodeEvidence::EditableDocument
-        ) {
+        ) || transient_top_editable_element_caret_anchor(
+            child,
+            transient_top_foreground,
+        )
+        .is_some()
+        {
             release_com(child);
             return true;
         }
 
-        if *remaining > 0 && descendant_contains_editable(walker, child, depth - 1, remaining) {
+        if *remaining > 0
+            && descendant_contains_editable(
+                walker,
+                child,
+                depth - 1,
+                remaining,
+                transient_top_foreground,
+            )
+        {
             release_com(child);
             return true;
         }
@@ -2648,6 +3108,7 @@ unsafe fn descendant_editable_caret_anchor(
     depth: usize,
     remaining: &mut usize,
     exact_geometry_only: bool,
+    transient_top_foreground: HWND,
 ) -> CaretProbeResult {
     if depth == 0 || *remaining == 0 {
         return CaretProbeResult::Missing;
@@ -2659,8 +3120,13 @@ unsafe fn descendant_editable_caret_anchor(
     let mut fallback = None;
     loop {
         *remaining = (*remaining).saturating_sub(1);
-        let editable =
-            evidence_accepts_caret_probe(inspect_element(child), false, exact_geometry_only);
+        let transient_fallback =
+            transient_top_editable_element_caret_anchor(child, transient_top_foreground);
+        let editable = evidence_accepts_caret_probe(
+            inspect_element(child),
+            false,
+            exact_geometry_only,
+        ) || transient_fallback.is_some();
 
         if editable {
             match probe_caret_anchor_from_uia_element(child, exact_geometry_only) {
@@ -2669,8 +3135,13 @@ unsafe fn descendant_editable_caret_anchor(
                     return CaretProbeResult::Found(point);
                 }
                 CaretProbeResult::Suppress => {
-                    release_com(child);
-                    return CaretProbeResult::Suppress;
+                    if transient_fallback.is_none() {
+                        release_com(child);
+                        return CaretProbeResult::Suppress;
+                    }
+                    if fallback.is_none() {
+                        fallback = transient_fallback;
+                    }
                 }
                 CaretProbeResult::Missing => {}
             }
@@ -2687,14 +3158,20 @@ unsafe fn descendant_editable_caret_anchor(
                         return CaretProbeResult::Found(point);
                     }
                     CaretProbeResult::Suppress => {
-                        release_com(child);
-                        return CaretProbeResult::Suppress;
+                        if transient_fallback.is_none() {
+                            release_com(child);
+                            return CaretProbeResult::Suppress;
+                        }
+                        if fallback.is_none() {
+                            fallback = transient_fallback;
+                        }
                     }
                     CaretProbeResult::Missing => {}
                 }
             }
             if fallback.is_none() {
-                fallback = empty_editable_element_caret_anchor(child);
+                fallback =
+                    empty_editable_element_caret_anchor(child).or(transient_fallback);
             }
         } else if *remaining > 0 {
             match descendant_editable_caret_anchor(
@@ -2703,6 +3180,7 @@ unsafe fn descendant_editable_caret_anchor(
                 depth - 1,
                 remaining,
                 exact_geometry_only,
+                transient_top_foreground,
             ) {
                 CaretProbeResult::Found(point) => {
                     release_com(child);
@@ -3191,6 +3669,69 @@ unsafe fn empty_editable_element_caret_anchor(element: *mut c_void) -> Option<Ca
     property_bounding_rect(element).and_then(editable_element_caret_anchor)
 }
 
+/// Some upper command/search surfaces expose their Edit/SearchBox semantics
+/// before their detailed focus and text-range metadata is ready. Accept the
+/// control's bounds as a temporary caret only when its UIA type is explicitly
+/// writable and it lies near the top of the foreground window.
+unsafe fn transient_top_editable_element_caret_anchor(
+    element: *mut c_void,
+    foreground: HWND,
+) -> Option<CaretAnchor> {
+    if foreground.is_null() || element_requires_exact_caret_geometry(element) {
+        return None;
+    }
+    if property_bool(element, UIA_IS_ENABLED_PROPERTY_ID) == Some(false)
+        || property_bool(element, UIA_VALUE_IS_READ_ONLY_PROPERTY_ID) == Some(true)
+    {
+        return None;
+    }
+
+    let control_type = property_i32(element, UIA_CONTROL_TYPE_PROPERTY_ID);
+    let aria_role = property_string(element, UIA_ARIA_ROLE_PROPERTY_ID)
+        .map(|role| role.trim().to_ascii_lowercase());
+    let explicitly_editable = matches!(
+        control_type,
+        Some(UIA_EDIT_CONTROL_TYPE_ID)
+    ) || aria_role
+        .as_deref()
+        .is_some_and(is_text_entry_aria_role)
+        || matches!(inspect_element(element), NodeEvidence::EditableField);
+    if !explicitly_editable {
+        return None;
+    }
+
+    let rect = property_bounding_rect(element)?;
+    if !rect.iter().all(|value| value.is_finite())
+        || rect[2] < MIN_TRANSIENT_TOP_EDITABLE_WIDTH
+        || rect[3] <= 0.0
+        || rect[3] > MAX_TRANSIENT_TOP_EDITABLE_HEIGHT
+    {
+        return None;
+    }
+    let anchor = editable_element_caret_anchor(rect)?;
+    anchor_is_near_top_of_window(anchor, foreground).then_some(anchor)
+}
+
+unsafe fn anchor_is_near_top_of_window(anchor: CaretAnchor, window: HWND) -> bool {
+    if window.is_null() {
+        return false;
+    }
+    let mut rect = RECT::default();
+    if GetWindowRect(window, &mut rect) == FALSE
+        || rect.right <= rect.left
+        || rect.bottom <= rect.top
+    {
+        return false;
+    }
+
+    let height = rect.bottom.saturating_sub(rect.top);
+    let top_band = (height / 3).clamp(96, 320);
+    anchor.x >= rect.left
+        && anchor.x <= rect.right
+        && anchor.bottom >= rect.top
+        && anchor.top <= rect.top.saturating_add(top_band)
+}
+
 fn editable_element_caret_anchor(rect: [f64; 4]) -> Option<CaretAnchor> {
     if !rect.iter().all(|value| value.is_finite()) || rect[2] <= 0.0 || rect[3] <= 0.0 {
         return None;
@@ -3475,7 +4016,15 @@ mod tests {
     fn chromium_and_firefox_use_uia_as_the_authoritative_caret_source() {
         assert!(is_uia_preferred_caret_class("Chrome_WidgetWin_1"));
         assert!(is_uia_preferred_caret_class("MozillaWindowClass"));
+        assert!(is_uia_preferred_caret_class("TaskManagerWindow"));
         assert!(!is_uia_preferred_caret_class("Notepad"));
+    }
+
+    #[test]
+    fn transient_top_input_hosts_are_narrowly_recognized() {
+        assert!(is_transient_top_input_host_class("Chrome_WidgetWin_1"));
+        assert!(is_transient_top_input_host_class("TaskManagerWindow"));
+        assert!(!is_transient_top_input_host_class("ApplicationFrameWindow"));
     }
 
     #[test]

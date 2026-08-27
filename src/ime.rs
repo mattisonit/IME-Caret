@@ -165,9 +165,11 @@ impl ImeEngine {
         );
 
         let foreground_process_id = window_process_id(foreground.foreground);
-        if focused_host.process_id != 0
-            && focused_host.process_id != foreground_process_id
-        {
+        if focused_host.process_id != 0 {
+            // A UIA focused element can belong to the same process as the
+            // foreground frame while its live IMM/TSF bridge is hosted by a
+            // separate top-level or child HWND. This enumeration is reached
+            // only when the caller supplied a focused UIA host.
             add_process_windows(
                 &mut candidates,
                 &mut seen,
@@ -200,6 +202,7 @@ impl ImeEngine {
             &mut seen,
             foreground_process_id,
             focused_host.process_id,
+            focused_host != FocusedInputHost::default(),
             now,
         );
         if candidates.len() > initial_candidate_count {
@@ -377,6 +380,7 @@ impl ImeEngine {
         seen: &mut HashSet<usize>,
         foreground_process_id: u32,
         focused_process_id: u32,
+        allow_text_input_host_bridge: bool,
         now: Instant,
     ) {
         let cache_is_current = self.shell_input_windows.as_ref().is_some_and(|cached| {
@@ -390,9 +394,11 @@ impl ImeEngine {
         if !cache_is_current {
             let mut windows = Vec::new();
             let mut cached_seen = HashSet::new();
-            for process_id in
-                modern_shell_input_processes(foreground_process_id, focused_process_id)
-            {
+            for process_id in modern_shell_input_processes(
+                foreground_process_id,
+                focused_process_id,
+                allow_text_input_host_bridge,
+            ) {
                 add_process_windows(&mut windows, &mut cached_seen, process_id);
                 if windows.len() >= MAX_ENUMERATED_INPUT_WINDOWS {
                     break;
@@ -608,6 +614,7 @@ unsafe fn add_process_windows(
 unsafe fn modern_shell_input_processes(
     foreground_process_id: u32,
     focused_process_id: u32,
+    allow_text_input_host_bridge: bool,
 ) -> Vec<u32> {
     let reference_process_id = if focused_process_id != 0 {
         focused_process_id
@@ -664,7 +671,14 @@ unsafe fn modern_shell_input_processes(
     CloseHandle(snapshot);
 
     if !shell_has_focus {
-        return Vec::new();
+        if !allow_text_input_host_bridge {
+            return Vec::new();
+        }
+        // A confirmed editable UIA host can use the session's CoreText/TSF
+        // bridge even when the foreground process itself isn't a Windows shell
+        // surface. Keep this fallback restricted to TextInputHost; unrelated
+        // Search/Start/Explorer windows must never contribute stale state.
+        candidates.retain(|candidate| candidate.1 == 0);
     }
 
     candidates.sort_unstable();

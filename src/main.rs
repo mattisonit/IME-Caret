@@ -42,7 +42,7 @@ mod windows_app {
     use std::time::{Duration, Instant};
 
     const APP_NAME: &str = "IME Caret";
-    const APP_VERSION: &str = "2.2";
+    const APP_VERSION: &str = "2.3";
     const MAIN_CLASS: &str = "ImeCaret.MainWindow";
     const BADGE_CLASS: &str = "ImeCaret.BadgeWindow";
     const SETTINGS_CLASS: &str = "ImeCaret.SettingsWindow";
@@ -51,6 +51,8 @@ mod windows_app {
     const TIMER_ID: usize = 1;
     const TRAY_HINT_TIMER_ID: usize = 2;
     const KEYBOARD_ACTIVITY_TIMER_ID: usize = 3;
+    const TASK_MANAGER_IME_STATE_TIMER_ID: usize = 4;
+    const TASK_MANAGER_IME_STATE_POLL_INTERVAL_MS: u32 = 50;
     const TRAY_ID: u32 = 1;
     const ACTIVE_IME_POLL_INTERVAL_MS: u32 = 100;
     const RAW_INPUT_ACTIVE_POLL_INTERVAL_MS: u32 = 500;
@@ -255,8 +257,12 @@ mod windows_app {
         caret_refresh_pending: bool,
         focus_activation_retries_remaining: u8,
         active_caret_anchor: Option<CaretAnchor>,
+        active_caret_reassert_topmost: bool,
         active_shell_overlay: Option<RECT>,
         active_focused_host: FocusedInputHost,
+        active_task_manager_search: bool,
+        task_manager_ime_process_id: u32,
+        task_manager_korean_open: Option<bool>,
     }
 
     impl AppState {
@@ -318,8 +324,12 @@ mod windows_app {
                 caret_refresh_pending: false,
                 focus_activation_retries_remaining: 0,
                 active_caret_anchor: None,
+                active_caret_reassert_topmost: false,
                 active_shell_overlay: None,
                 active_focused_host: FocusedInputHost::default(),
+                active_task_manager_search: false,
+                task_manager_ime_process_id: 0,
+                task_manager_korean_open: None,
             }
         }
 
@@ -440,11 +450,11 @@ mod windows_app {
                 self.refresh_from_active_caret();
             }
             if delayed_focus_surface {
-                // Excel 2016 creates its modeless Find/Replace controls after
-                // the Ctrl+F/H Raw Input signal. The ordinary 20 ms refresh
-                // can therefore still see the worksheet caret. Probe a small
-                // bounded 300 ms window so the dialog is caught after it has
-                // materialized without affecting ordinary keyboard activity.
+                // Excel Find/Replace and command/search overlays can create
+                // their focused control after the shortcut's Raw Input
+                // signal. Probe a small bounded window so the new surface is
+                // caught after it has materialized without affecting ordinary
+                // keyboard activity.
                 self.editability_detector.invalidate_focus_cache();
                 self.delayed_focus_surface_retries_remaining =
                     DELAYED_FOCUS_SURFACE_RETRY_COUNT;
@@ -530,6 +540,20 @@ mod windows_app {
             // Mouse position and mouse cursor state are deliberately ignored.
             // The indicator follows only a positively identified editable caret.
             let input_context = FocusedInputContext::capture();
+            let task_manager_search = task_manager_search_is_active(input_context);
+            if task_manager_search {
+                if !self.active_task_manager_search
+                    || self.task_manager_ime_process_id != input_context.process_id
+                {
+                    self.task_manager_ime_process_id = input_context.process_id;
+                    self.task_manager_korean_open = match self.old_kind {
+                        Some(ImeKind::Korean) => Some(true),
+                        Some(ImeKind::English) => Some(false),
+                        _ => None,
+                    };
+                }
+            }
+            self.set_task_manager_search_active(task_manager_search);
             let editability = self
                 .editability_detector
                 .focused_input_with_context(input_context);
@@ -540,10 +564,30 @@ mod windows_app {
             }
 
             let shell_overlay = self.active_shell_overlay_bounds(input_context.foreground);
-            let focused_host = self.focused_input_host_for_shell(input_context);
-            let snapshot = self
+            let mut focused_host = self.focused_input_host_for_shell(input_context);
+            let mut snapshot = self
                 .ime_engine
                 .query_with_context(focused_host, input_context);
+            if snapshot.validity == Validity::Invalid
+                && focused_host == FocusedInputHost::default()
+            {
+                // Electron and WinUI can keep their visible editor in the
+                // foreground frame while the live input context belongs to a
+                // UIA-published native host. The shell path already supplies
+                // that identity; for ordinary apps, pay for the extra UIA
+                // ancestry walk only after the cheap HWND query has failed.
+                focused_host = self
+                    .editability_detector
+                    .focused_input_host_with_context(input_context);
+                if focused_host != FocusedInputHost::default() {
+                    WIN_EVENT_ALLOWED_HOST_PROCESS_ID
+                        .store(focused_host.process_id, Ordering::Release);
+                    snapshot = self
+                        .ime_engine
+                        .query_with_context(focused_host, input_context);
+                }
+            }
+            snapshot = self.apply_task_manager_ime_override(snapshot);
             if snapshot.validity == Validity::Invalid {
                 self.clear_active_caret();
                 self.show_ime(
@@ -572,16 +616,39 @@ mod windows_app {
             };
 
             self.active_caret_anchor = Some(anchor);
+            self.active_caret_reassert_topmost = self
+                .editability_detector
+                .caret_needs_topmost_reassert();
             self.active_shell_overlay = shell_overlay;
             self.active_focused_host = focused_host;
             self.show_ime(snapshot, anchor, shell_overlay);
-            if self.badge_visible {
+            if self.badge_visible && !self.active_caret_reassert_topmost {
                 self.focus_activation_retries_remaining = 0;
             }
         }
 
-        fn schedule_focus_activation_retry_if_needed(&mut self) {
-            if self.badge_visible {
+        unsafe fn schedule_focus_activation_retry_if_needed(&mut self) {
+            if self.badge_visible
+                && self.active_caret_reassert_topmost
+                && self.focus_activation_retries_remaining > 0
+            {
+                if let Some((x, y)) = self.badge_position {
+                    SetWindowPos(
+                        self.badge_hwnd,
+                        HWND_TOPMOST,
+                        x,
+                        y,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    );
+                }
+                self.focus_activation_retries_remaining -= 1;
+                if self.focus_activation_retries_remaining > 0 {
+                    self.editability_detector.invalidate_focus_cache();
+                    self.full_refresh_pending = true;
+                }
+            } else if self.badge_visible {
                 self.focus_activation_retries_remaining = 0;
             } else if self.focus_activation_retries_remaining > 0 {
                 self.focus_activation_retries_remaining -= 1;
@@ -599,12 +666,9 @@ mod windows_app {
                 return;
             }
 
-            // Excel's modeless Find/Replace dialog can complete its Z-order
-            // activation after the badge has already been shown. When the
-            // caret position is unchanged, the ordinary lightweight update
-            // deliberately skips SetWindowPos, leaving the badge underneath
-            // the dialog until typing moves the caret. Reassert topmost only
-            // during these bounded Ctrl+F/H activation retries.
+            // A modeless find dialog or command/search overlay can complete
+            // its Z-order activation after the badge has already been shown.
+            // Reassert topmost only during these bounded shortcut retries.
             if self.badge_visible {
                 if let Some((x, y)) = self.badge_position {
                     SetWindowPos(
@@ -654,6 +718,9 @@ mod windows_app {
 
             self.last_caret_refresh = Some(Instant::now());
             self.active_caret_anchor = Some(anchor);
+            self.active_caret_reassert_topmost = self
+                .editability_detector
+                .caret_needs_topmost_reassert();
             self.update_active_caret_indicator(
                 kind,
                 self.old_caps,
@@ -670,6 +737,7 @@ mod windows_app {
             };
 
             let snapshot = self.ime_engine.query(self.active_focused_host);
+            let snapshot = self.apply_task_manager_ime_override(snapshot);
             if snapshot.validity == Validity::Invalid {
                 self.refresh_from_active_caret();
                 return;
@@ -677,8 +745,69 @@ mod windows_app {
             self.show_ime(snapshot, anchor, self.active_shell_overlay);
         }
 
+        fn apply_task_manager_ime_override(&self, mut snapshot: ImeSnapshot) -> ImeSnapshot {
+            if self.active_task_manager_search
+                && (snapshot.language_id & 0x03ff) == 0x12
+            {
+                if let Some(is_open) = self.task_manager_korean_open {
+                    snapshot.is_open = is_open;
+                    snapshot.conversion_mode = if is_open { 1 } else { 0 };
+                }
+            }
+            snapshot
+        }
+
+        unsafe fn set_task_manager_search_active(&mut self, active: bool) {
+            if self.active_task_manager_search == active {
+                return;
+            }
+
+            self.active_task_manager_search = active;
+            if active {
+                self.refresh_task_manager_ime_from_system_indicator();
+                SetTimer(
+                    self.main_hwnd,
+                    TASK_MANAGER_IME_STATE_TIMER_ID,
+                    TASK_MANAGER_IME_STATE_POLL_INTERVAL_MS,
+                    None,
+                );
+            } else {
+                KillTimer(self.main_hwnd, TASK_MANAGER_IME_STATE_TIMER_ID);
+            }
+        }
+
+        unsafe fn on_task_manager_ime_state_timer(&mut self) {
+            if self.cleaning_up || !self.active_task_manager_search {
+                return;
+            }
+
+            let input_context = FocusedInputContext::capture();
+            if !task_manager_search_is_active(input_context) {
+                self.set_task_manager_search_active(false);
+                return;
+            }
+
+            if self.refresh_task_manager_ime_from_system_indicator() {
+                self.last_activity = Instant::now();
+                self.refresh_ime_state_only();
+            }
+        }
+
+        fn refresh_task_manager_ime_from_system_indicator(&mut self) -> bool {
+            let Some(korean_open) = self
+                .editability_detector
+                .taskbar_korean_input_mode()
+            else {
+                return false;
+            };
+            let changed = self.task_manager_korean_open != Some(korean_open);
+            self.task_manager_korean_open = Some(korean_open);
+            changed
+        }
+
         fn clear_active_caret(&mut self) {
             self.active_caret_anchor = None;
+            self.active_caret_reassert_topmost = false;
             self.active_shell_overlay = None;
             self.active_focused_host = FocusedInputHost::default();
         }
@@ -919,7 +1048,7 @@ mod windows_app {
             // dialog, refresh the badge's topmost order even when the caret
             // geometry is unchanged; otherwise the badge can remain hidden
             // until typing or moving the dialog changes its position.
-            if is_excel_find_replace_foreground() {
+            if self.active_caret_reassert_topmost || is_excel_find_replace_foreground() {
                 SetWindowPos(
                     self.badge_hwnd,
                     HWND_TOPMOST,
@@ -1398,6 +1527,7 @@ mod windows_app {
             if !self.main_hwnd.is_null() {
                 KillTimer(self.main_hwnd, TIMER_ID);
                 KillTimer(self.main_hwnd, KEYBOARD_ACTIVITY_TIMER_ID);
+                KillTimer(self.main_hwnd, TASK_MANAGER_IME_STATE_TIMER_ID);
             }
             self.keyboard_activity_pending = false;
             self.keyboard_activity_covered_by_caret_event = false;
@@ -1559,8 +1689,31 @@ mod windows_app {
         raw_keyboard_key_can_change_ime(virtual_key) || keyboard_modifier_is_down()
     }
 
+    unsafe fn window_class_equals(window: HWND, expected: &str) -> bool {
+        if window.is_null() {
+            return false;
+        }
+        let mut class_name = [0u16; 128];
+        let length = GetClassNameW(
+            window,
+            class_name.as_mut_ptr(),
+            class_name.len() as i32,
+        );
+        length > 0
+            && String::from_utf16_lossy(&class_name[..length as usize])
+                .eq_ignore_ascii_case(expected)
+    }
+
+    unsafe fn task_manager_search_is_active(context: FocusedInputContext) -> bool {
+        window_class_equals(context.foreground, "TaskManagerWindow")
+            && window_class_equals(
+                context.focus,
+                "Windows.UI.Input.InputSite.WindowClass",
+            )
+    }
+
     unsafe fn raw_keyboard_signal_opens_delayed_focus_surface(signal: RawKeyboardSignal) -> bool {
-        matches!(signal.virtual_key, 0x46 | 0x48) && GetAsyncKeyState(VK_CONTROL) < 0
+        matches!(signal.virtual_key, 0x46 | 0x48 | 0x50) && GetAsyncKeyState(VK_CONTROL) < 0
     }
 
     unsafe fn is_excel_find_replace_foreground() -> bool {
@@ -1917,6 +2070,10 @@ mod windows_app {
             }
             WM_TIMER if wparam == KEYBOARD_ACTIVITY_TIMER_ID => {
                 state.on_keyboard_activity_timer();
+                0
+            }
+            WM_TIMER if wparam == TASK_MANAGER_IME_STATE_TIMER_ID => {
+                state.on_task_manager_ime_state_timer();
                 0
             }
             WM_TIMER if wparam == TRAY_HINT_TIMER_ID => {
@@ -3470,7 +3627,7 @@ mod windows_app {
 
         #[test]
         fn tray_tooltip_contains_program_name_and_version() {
-            assert_eq!(tray_tooltip_text(), "IME Caret 2.2");
+            assert_eq!(tray_tooltip_text(), "IME Caret 2.3");
         }
 
         #[test]

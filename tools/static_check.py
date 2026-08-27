@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dependency-free static checks for IME Caret 2.2."""
+"""Dependency-free static checks for IME Caret 2.3."""
 
 from __future__ import annotations
 
@@ -121,9 +121,9 @@ def main() -> None:
 
     cargo = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
     assert cargo["package"]["name"] == "ime-caret"
-    assert cargo["package"]["version"] == "2.2.0"
+    assert cargo["package"]["version"] == "2.3.0"
     assert 'name = "ime-caret"' in (ROOT / "Cargo.lock").read_text(encoding="utf-8")
-    assert 'version = "2.2.0"' in (ROOT / "Cargo.lock").read_text(encoding="utf-8")
+    assert 'version = "2.3.0"' in (ROOT / "Cargo.lock").read_text(encoding="utf-8")
     assert "active editable text caret" in cargo["package"]["description"]
 
     main_rs = (SRC / "main.rs").read_text(encoding="utf-8")
@@ -136,7 +136,7 @@ def main() -> None:
     all_source = "\n".join([main_rs, ime_rs, editability_rs, outlook_rs, config_rs, win_rs, assets_rs])
 
     assert 'const APP_NAME: &str = "IME Caret";' in main_rs
-    assert 'const APP_VERSION: &str = "2.2";' in main_rs
+    assert 'const APP_VERSION: &str = "2.3";' in main_rs
     assert "tray_tooltip_text()" in main_rs
     assert 'PathBuf::from("IME Caret.exe")' in main_rs
     assert 'exe_dir.join("IMECaret.ini")' in main_rs
@@ -188,6 +188,8 @@ def main() -> None:
         "focused_caret_anchor_with_context(input_context, console_cell_span)"
     )
     assert "focused_input_host_for_shell(input_context)" in refresh_body
+    assert "focused_input_host_with_context(input_context)" in refresh_body
+    assert "snapshot.validity == Validity::Invalid" in refresh_body
     assert refresh_body.count("FocusedInputContext::capture()") == 1
     assert "GetCursorPos" not in refresh_body
 
@@ -216,6 +218,7 @@ def main() -> None:
     assert "UnhookWinEvent(" in main_rs
     assert "WIN_EVENT_PENDING_FLAGS.fetch_or" in main_rs
     assert "WIN_EVENT_ALLOWED_HOST_PROCESS_ID" in main_rs
+    assert "allow_text_input_host_bridge" in ime_rs
     assert "win_event_source_is_relevant" in main_rs
     assert "RegisterRawInputDevices(" in main_rs
     assert "RIDEV_INPUTSINK" in main_rs
@@ -338,6 +341,8 @@ def main() -> None:
     assert "text_range_move_endpoint_by_unit" in editability_rs
     assert "UIA_VALUE_VALUE_PROPERTY_ID" in editability_rs
     assert "empty_editable_element_caret_anchor" in editability_rs
+    assert "transient_top_editable_element_caret_anchor" in editability_rs
+    assert "caret_needs_topmost_reassert" in editability_rs
     caret_probe_start = editability_rs.index("unsafe fn focused_caret_anchor_unsafe")
     caret_probe_end = editability_rs.index("unsafe fn focused_input_unsafe", caret_probe_start)
     caret_probe = editability_rs[caret_probe_start:caret_probe_end]
@@ -396,7 +401,7 @@ def main() -> None:
     console_branch_start = caret_probe.index("if console_like", browser_branch_end)
     console_branch_end = caret_probe.index("if let Some(anchor) = win32_caret_anchor", console_branch_start)
     console_branch = caret_probe[console_branch_start:console_branch_end]
-    assert "self.uia_focused_caret_anchor(targets, true, false)" in console_branch
+    assert "self.uia_focused_caret_anchor(targets, true, false, false)" in console_branch
     assert caret_probe.index("if console_like", browser_branch_end) < caret_probe.index("win32_caret_anchor")
     assert "selection_range.is_none()" in editability_rs
     assert "pattern2.and_then(|pattern| text_pattern_selection_range(pattern))" in editability_rs
@@ -464,7 +469,7 @@ def main() -> None:
             assert audio.getframerate() == 22050
             assert audio.getnframes() > 0
 
-    print("IME Caret 2.2 static checks passed")
+    print("IME Caret 2.3 static checks passed")
 
 
 if __name__ == "__main__":
