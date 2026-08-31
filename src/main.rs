@@ -42,7 +42,7 @@ mod windows_app {
     use std::time::{Duration, Instant};
 
     const APP_NAME: &str = "IME Caret";
-    const APP_VERSION: &str = "2.3";
+    const APP_VERSION: &str = "2.4";
     const MAIN_CLASS: &str = "ImeCaret.MainWindow";
     const BADGE_CLASS: &str = "ImeCaret.BadgeWindow";
     const SETTINGS_CLASS: &str = "ImeCaret.SettingsWindow";
@@ -3627,7 +3627,7 @@ mod windows_app {
 
         #[test]
         fn tray_tooltip_contains_program_name_and_version() {
-            assert_eq!(tray_tooltip_text(), "IME Caret 2.3");
+            assert_eq!(tray_tooltip_text(), "IME Caret 2.4");
         }
 
         #[test]

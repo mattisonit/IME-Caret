@@ -25,6 +25,7 @@ const UIA_CLASS_NAME_PROPERTY_ID: i32 = 30012;
 const UIA_HAS_KEYBOARD_FOCUS_PROPERTY_ID: i32 = 30008;
 const UIA_IS_KEYBOARD_FOCUSABLE_PROPERTY_ID: i32 = 30009;
 const UIA_IS_ENABLED_PROPERTY_ID: i32 = 30010;
+const UIA_IS_TEXT_PATTERN_AVAILABLE_PROPERTY_ID: i32 = 30040;
 const UIA_IS_VALUE_PATTERN_AVAILABLE_PROPERTY_ID: i32 = 30043;
 const UIA_VALUE_VALUE_PROPERTY_ID: i32 = 30045;
 const UIA_VALUE_IS_READ_ONLY_PROPERTY_ID: i32 = 30046;
@@ -36,6 +37,7 @@ const UIA_NATIVE_WINDOW_HANDLE_PROPERTY_ID: i32 = 30020;
 const UIA_COMBO_BOX_CONTROL_TYPE_ID: i32 = 50003;
 const UIA_EDIT_CONTROL_TYPE_ID: i32 = 50004;
 const UIA_TEXT_CONTROL_TYPE_ID: i32 = 50020;
+const UIA_GROUP_CONTROL_TYPE_ID: i32 = 50026;
 const UIA_DOCUMENT_CONTROL_TYPE_ID: i32 = 50030;
 
 const STATE_SYSTEM_UNAVAILABLE: i32 = 0x0000_0001;
@@ -2517,6 +2519,25 @@ unsafe fn inspect_element(element: *mut c_void) -> NodeEvidence {
                 NodeEvidence::EditableDocument
             } else {
                 NodeEvidence::SelectableText
+            }
+        }
+        Some(UIA_GROUP_CONTROL_TYPE_ID) => {
+            // Naver and Daum rich-mail bodies can expose their active
+            // contenteditable surface as a focused Group rather than an Edit
+            // or Document. Require both editing-specific TextEditPattern and
+            // TextPattern plus explicit keyboard focus so ordinary layout
+            // groups and readable web content remain excluded.
+            if has_keyboard_focus == Some(true)
+                && keyboard_focusable == Some(true)
+                && text_edit_pattern
+                // Keep this additional COM property query last so the many
+                // unfocused layout groups in browser trees are rejected by
+                // the cached properties above without paying for it.
+                && property_bool(element, UIA_IS_TEXT_PATTERN_AVAILABLE_PROPERTY_ID) == Some(true)
+            {
+                NodeEvidence::EditableField
+            } else {
+                NodeEvidence::Unknown
             }
         }
         Some(UIA_TEXT_CONTROL_TYPE_ID) => NodeEvidence::SelectableText,
