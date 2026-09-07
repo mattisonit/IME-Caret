@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 const FOCUS_PROBE_CACHE_DURATION: Duration = Duration::from_millis(250);
 const UIA_FOCUSED_ELEMENT_CACHE_DURATION: Duration = Duration::from_millis(100);
 const OUTLOOK_CARET_CACHE_DURATION: Duration = Duration::from_millis(120);
+const TASKBAR_INPUT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_UIA_PARENT_DEPTH: usize = 12;
 const MAX_UIA_CARET_PARENT_DEPTH: usize = 12;
 const MAX_UIA_CARET_DESCENDANT_DEPTH: usize = 4;
@@ -292,6 +293,7 @@ pub struct EditabilityDetector {
     automation: *mut c_void,
     raw_view_walker: *mut c_void,
     taskbar_input_indicator_element: *mut c_void,
+    taskbar_input_search_tick: Option<Instant>,
     co_initialized: bool,
     last_focus_probe: Option<CachedFocusProbe>,
     focused_element_cache: Option<CachedFocusedElement>,
@@ -337,6 +339,7 @@ impl EditabilityDetector {
             automation,
             raw_view_walker,
             taskbar_input_indicator_element: null_mut(),
+            taskbar_input_search_tick: None,
             co_initialized,
             last_focus_probe: None,
             focused_element_cache: None,
@@ -581,6 +584,10 @@ impl EditabilityDetector {
         unsafe { self.taskbar_korean_input_mode_unsafe() }
     }
 
+    pub fn reset_taskbar_input_retry(&mut self) {
+        self.taskbar_input_search_tick = None;
+    }
+
     unsafe fn taskbar_korean_input_mode_unsafe(&mut self) -> Option<bool> {
         if self.automation.is_null() || self.raw_view_walker.is_null() {
             return None;
@@ -594,7 +601,20 @@ impl EditabilityDetector {
             self.taskbar_input_indicator_element = null_mut();
         }
 
-        let class_name: Vec<u16> = "Shell_TrayWnd".encode_utf16().chain(Some(0)).collect();
+        // Only failed discovery is throttled. A cached element still exposes
+        // live mode changes on every caller tick, and focus activation resets
+        // the delay so the first probe is always immediate.
+        let now = Instant::now();
+        if self
+            .taskbar_input_search_tick
+            .and_then(|tick| now.checked_duration_since(tick))
+            .is_some_and(|age| age < TASKBAR_INPUT_RETRY_INTERVAL)
+        {
+            return None;
+        }
+        self.taskbar_input_search_tick = Some(now);
+
+        let class_name = (*b"Shell_TrayWnd\0").map(u16::from);
         let taskbar = FindWindowW(class_name.as_ptr(), null());
         if taskbar.is_null() {
             return None;
@@ -612,6 +632,7 @@ impl EditabilityDetector {
         );
         release_com(element);
         self.taskbar_input_indicator_element = indicator?;
+        self.taskbar_input_search_tick = None;
         taskbar_input_mode_from_element(self.taskbar_input_indicator_element)
     }
 
@@ -1184,10 +1205,22 @@ impl EditabilityDetector {
         let Some(element) = self.focused_element_for_targets(targets) else {
             return Editability::Unknown;
         };
-        let transient_top_foreground = window_class_name(targets.foreground)
-            .filter(|class_name| is_transient_top_input_host_class(class_name))
-            .map(|_| targets.foreground)
-            .unwrap_or(null_mut());
+        let initial_evidence = inspect_element(element);
+        if matches!(
+            initial_evidence,
+            NodeEvidence::EditableField | NodeEvidence::EditableDocument
+        ) {
+            release_com(element);
+            return Editability::Editable;
+        }
+        let transient_top_foreground = if self
+            .foreground_window_profile(targets.foreground)
+            .transient_top_input_host
+        {
+            targets.foreground
+        } else {
+            null_mut()
+        };
 
         // Chromium can report focus on an anonymous wrapper while the actual
         // search/edit element is a nearby descendant. Probe only a small raw
@@ -1207,7 +1240,7 @@ impl EditabilityDetector {
             }
         }
 
-        self.classify_element_chain(element, transient_top_foreground)
+        self.classify_element_chain(element, transient_top_foreground, initial_evidence)
     }
 
     unsafe fn uia_focused_caret_anchor(
@@ -1372,14 +1405,14 @@ impl EditabilityDetector {
                 // one of its ancestors. YouTube's search field is a common
                 // example. Search a small, bounded descendant subtree before
                 // using the element rectangle only for a confirmed empty field.
+                let subtree_editable_only = exact_geometry_only
+                    || !transient_top_foreground.is_null();
                 let initial_subtree_already_probed = initial_element
                     && initial_subtree_probed
-                    && initial_subtree_editable_only == exact_geometry_only;
+                    && initial_subtree_editable_only == subtree_editable_only;
                 if !self.raw_view_walker.is_null() && !initial_subtree_already_probed {
                     let mut remaining = MAX_UIA_CARET_DESCENDANT_NODES;
-                    let descendant = if exact_geometry_only
-                        || !transient_top_foreground.is_null()
-                    {
+                    let descendant = if subtree_editable_only {
                         descendant_editable_caret_anchor(
                             self.raw_view_walker,
                             element,
@@ -1444,31 +1477,22 @@ impl EditabilityDetector {
         &self,
         mut element: *mut c_void,
         foreground: HWND,
+        initial_evidence: NodeEvidence,
     ) -> Editability {
         let mut saw_read_only = false;
         let mut saw_selectable_text = false;
         let mut saw_code_like_text = false;
-        for _ in 0..MAX_UIA_PARENT_DEPTH {
+        for depth in 0..MAX_UIA_PARENT_DEPTH {
             // VS Code keeps accessibility focus on the selected Quick Open
             // result while keyboard input still belongs to an Edit sibling.
             // Task Manager similarly focuses its native InputSite while the
             // writable search provider lives below the enclosing top bridge.
-            // Search descendants only inside these narrowly identified input
-            // containers; never scan an application's full document tree.
+            // These narrowly identified containers are already accepted even
+            // when their Edit provider is absent. Descendant searches belong
+            // to the caret geometry pass; they cannot change this decision.
             if !self.raw_view_walker.is_null()
                 && is_scoped_top_input_container(element, foreground)
             {
-                let mut remaining = MAX_SCOPED_TOP_INPUT_DESCENDANT_NODES;
-                if descendant_contains_editable(
-                    self.raw_view_walker,
-                    element,
-                    MAX_SCOPED_TOP_INPUT_DESCENDANT_DEPTH,
-                    &mut remaining,
-                    foreground,
-                ) {
-                    release_com(element);
-                    return Editability::Editable;
-                }
                 // These containers are reached only while their descendant
                 // owns accessibility focus. VS Code uses aria-activedescendant
                 // on a result row, and Task Manager exposes only its native
@@ -1481,7 +1505,12 @@ impl EditabilityDetector {
                 release_com(element);
                 return Editability::Editable;
             }
-            match inspect_element(element) {
+            let evidence = if depth == 0 {
+                initial_evidence
+            } else {
+                inspect_element(element)
+            };
+            match evidence {
                 NodeEvidence::EditableField if !saw_code_like_text => {
                     release_com(element);
                     return Editability::Editable;
@@ -2091,23 +2120,25 @@ fn scale_between_dpi(value: i32, from_dpi: u32, to_dpi: u32) -> i32 {
 }
 
 fn is_console_like_class(class_name: &str) -> bool {
-    matches!(
-        class_name.to_ascii_lowercase().as_str(),
-        "consolewindowclass" | "cascadia_hosting_window_class" | "virtualconsoleclass"
-    )
+    class_name.eq_ignore_ascii_case("ConsoleWindowClass")
+        || class_name.eq_ignore_ascii_case("CASCADIA_HOSTING_WINDOW_CLASS")
+        || class_name.eq_ignore_ascii_case("VirtualConsoleClass")
 }
 
 fn is_uia_preferred_caret_class(class_name: &str) -> bool {
-    let normalized = class_name.to_ascii_lowercase();
-    normalized.starts_with("chrome_widgetwin_")
-        || normalized == "mozillawindowclass"
-        || normalized == "taskmanagerwindow"
+    is_chromium_widget_class(class_name)
+        || class_name.eq_ignore_ascii_case("MozillaWindowClass")
+        || class_name.eq_ignore_ascii_case("TaskManagerWindow")
 }
 
 fn is_chromium_widget_class(class_name: &str) -> bool {
-    class_name
-        .to_ascii_lowercase()
-        .starts_with("chrome_widgetwin_")
+    starts_with_ascii_case(class_name, "Chrome_WidgetWin_")
+}
+
+fn starts_with_ascii_case(value: &str, prefix: &str) -> bool {
+    value.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
 fn is_transient_top_input_host_class(class_name: &str) -> bool {
@@ -2161,15 +2192,13 @@ unsafe fn is_excel_host_window(window: HWND) -> bool {
 }
 
 fn is_excel_host_class(class_name: &str) -> bool {
-    let normalized = class_name.to_ascii_lowercase();
-    normalized == "xlmain" || normalized.starts_with("bosa_sdm_xl")
+    class_name.eq_ignore_ascii_case("XLMAIN") || is_excel_dialog_class(class_name)
 }
 
 fn is_excel_editor_class(class_name: &str) -> bool {
-    matches!(
-        class_name.to_ascii_lowercase().as_str(),
-        "excel6" | "excel<" | "edtbx"
-    )
+    class_name.eq_ignore_ascii_case("EXCEL6")
+        || class_name.eq_ignore_ascii_case("EXCEL<")
+        || class_name.eq_ignore_ascii_case("EDTBX")
 }
 
 #[derive(Default)]
@@ -2221,9 +2250,7 @@ unsafe fn excel_dialog_root(window: HWND) -> Option<HWND> {
 }
 
 fn is_excel_dialog_class(class_name: &str) -> bool {
-    class_name
-        .to_ascii_lowercase()
-        .starts_with("bosa_sdm_xl")
+    starts_with_ascii_case(class_name, "bosa_sdm_XL")
 }
 
 #[derive(Default)]
@@ -2470,6 +2497,21 @@ unsafe fn inspect_element(element: *mut c_void) -> NodeEvidence {
         return NodeEvidence::CodeLikeText;
     }
 
+    // A combobox can be select-only even when Value.IsReadOnly is false:
+    // changing the selected option is not the same as typing text. Reuse the
+    // properties already read above; do not query another pattern here.
+    let combo_box = control_type == Some(UIA_COMBO_BOX_CONTROL_TYPE_ID)
+        || aria_role.as_deref().is_some_and(is_combobox_aria_role);
+    if combo_box {
+        return if (has_keyboard_focus == Some(true) || keyboard_focusable == Some(true))
+            && (control_type == Some(UIA_EDIT_CONTROL_TYPE_ID) || text_edit_pattern)
+        {
+            NodeEvidence::EditableField
+        } else {
+            NodeEvidence::Unknown
+        };
+    }
+
     // Custom browser controls are accepted only when their semantic role says
     // that they are text-entry controls and they can receive keyboard focus.
     if aria_role.as_deref().is_some_and(is_text_entry_aria_role) {
@@ -2493,18 +2535,6 @@ unsafe fn inspect_element(element: *mut c_void) -> NodeEvidence {
                 NodeEvidence::EditableField
             } else if keyboard_focusable == Some(false) {
                 NodeEvidence::ReadOnly
-            } else {
-                NodeEvidence::Unknown
-            }
-        }
-        Some(UIA_COMBO_BOX_CONTROL_TYPE_ID) => {
-            // Search fields may be exposed as editable combo boxes when
-            // autocomplete suggestions are active. Non-editable drop-downs do
-            // not expose a writable Value or TextEdit pattern.
-            if (has_keyboard_focus == Some(true) || keyboard_focusable == Some(true))
-                && (value_is_read_only == Some(false) || text_edit_pattern)
-            {
-                NodeEvidence::EditableField
             } else {
                 NodeEvidence::Unknown
             }
@@ -2559,6 +2589,10 @@ fn is_code_like_aria_role(role: &str) -> bool {
 fn is_text_entry_aria_role(role: &str) -> bool {
     role.split_ascii_whitespace()
         .any(|token| matches!(token, "textbox" | "searchbox" | "spinbutton" | "combobox"))
+}
+
+fn is_combobox_aria_role(role: &str) -> bool {
+    role.split_ascii_whitespace().any(|token| token == "combobox")
 }
 
 unsafe fn is_scoped_top_input_container(element: *mut c_void, foreground: HWND) -> bool {
@@ -3710,6 +3744,15 @@ unsafe fn transient_top_editable_element_caret_anchor(
     let control_type = property_i32(element, UIA_CONTROL_TYPE_PROPERTY_ID);
     let aria_role = property_string(element, UIA_ARIA_ROLE_PROPERTY_ID)
         .map(|role| role.trim().to_ascii_lowercase());
+    // Do not guess a caret from a select-only/ambiguous combobox rectangle.
+    // Verified editable combos still use the normal text-range/accessibility
+    // caret paths. An actual Edit control retains the temporary fallback.
+    if control_type != Some(UIA_EDIT_CONTROL_TYPE_ID)
+        && (control_type == Some(UIA_COMBO_BOX_CONTROL_TYPE_ID)
+            || aria_role.as_deref().is_some_and(is_combobox_aria_role))
+    {
+        return None;
+    }
     let explicitly_editable = matches!(
         control_type,
         Some(UIA_EDIT_CONTROL_TYPE_ID)

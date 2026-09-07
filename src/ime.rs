@@ -164,6 +164,20 @@ impl ImeEngine {
             focused_host.native_window,
         );
 
+        // Most inputs are resolved by the focus/parent HWND chain. Only walk
+        // every window in the UIA host process if these direct candidates fail.
+        // Share the helper-window set across all stages of this refresh.
+        let mut queried_ime_windows = HashSet::<usize>::with_capacity(candidates.len());
+        if let Some(snapshot) = self.query_live_candidates(
+            &candidates,
+            &mut queried_ime_windows,
+            foreground,
+            focused_host,
+            now,
+        ) {
+            return snapshot;
+        }
+        let direct_candidate_count = candidates.len();
         let foreground_process_id = window_process_id(foreground.foreground);
         if focused_host.process_id != 0 {
             // A UIA focused element can belong to the same process as the
@@ -184,9 +198,13 @@ impl ImeEngine {
             return ImeSnapshot::default();
         }
 
-        if let Some(snapshot) =
-            self.query_live_candidates(&candidates, foreground, focused_host, now)
-        {
+        if let Some(snapshot) = self.query_live_candidates(
+            &candidates[direct_candidate_count..],
+            &mut queried_ime_windows,
+            foreground,
+            focused_host,
+            now,
+        ) {
             return snapshot;
         }
 
@@ -209,6 +227,7 @@ impl ImeEngine {
             if let Some(snapshot) =
                 self.query_live_candidates(
                     &candidates[initial_candidate_count..],
+                    &mut queried_ime_windows,
                     foreground,
                     focused_host,
                     now,
@@ -276,12 +295,11 @@ impl ImeEngine {
     unsafe fn query_live_candidates(
         &mut self,
         candidates: &[HWND],
+        queried_ime_windows: &mut HashSet<usize>,
         foreground: ForegroundTargets,
         focused_host: FocusedInputHost,
         now: Instant,
     ) -> Option<ImeSnapshot> {
-        let mut queried_ime_windows = HashSet::<usize>::with_capacity(candidates.len());
-
         for &hwnd in candidates {
             let thread_id = window_thread(hwnd);
             let ime_window = ImmGetDefaultIMEWnd(hwnd);

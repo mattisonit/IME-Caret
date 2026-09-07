@@ -27,7 +27,10 @@ New-Item -ItemType Directory -Force -Path $dist | Out-Null
 $sourceExe = Join-Path $PSScriptRoot "target\release\ime-caret.exe"
 $targetExe = Join-Path $dist "IMECaret.exe"
 Copy-Item -Force $sourceExe $targetExe
-Copy-Item -Force (Join-Path $PSScriptRoot "IMECaret.ini") $dist
+$targetConfig = Join-Path $dist "IMECaret.ini"
+if (-not (Test-Path -LiteralPath $targetConfig)) {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot "IMECaret.ini") -Destination $targetConfig
+}
 
 foreach ($name in @("IMEE.wav", "IMEJ.wav", "IMEK.wav")) {
     $sound = Join-Path $PSScriptRoot ("assets\" + $name)

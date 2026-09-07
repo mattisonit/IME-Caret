@@ -42,7 +42,7 @@ mod windows_app {
     use std::time::{Duration, Instant};
 
     const APP_NAME: &str = "IME Caret";
-    const APP_VERSION: &str = "2.4";
+    const APP_VERSION: &str = "2.5";
     const MAIN_CLASS: &str = "ImeCaret.MainWindow";
     const BADGE_CLASS: &str = "ImeCaret.BadgeWindow";
     const SETTINGS_CLASS: &str = "ImeCaret.SettingsWindow";
@@ -764,6 +764,7 @@ mod windows_app {
 
             self.active_task_manager_search = active;
             if active {
+                self.editability_detector.reset_taskbar_input_retry();
                 self.refresh_task_manager_ime_from_system_indicator();
                 SetTimer(
                     self.main_hwnd,
@@ -3627,7 +3628,7 @@ mod windows_app {
 
         #[test]
         fn tray_tooltip_contains_program_name_and_version() {
-            assert_eq!(tray_tooltip_text(), "IME Caret 2.4");
+            assert_eq!(tray_tooltip_text(), "IME Caret 2.5");
         }
 
         #[test]

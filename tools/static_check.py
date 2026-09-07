@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dependency-free static checks for IME Caret 2.4."""
+"""Dependency-free static checks for IME Caret 2.5."""
 
 from __future__ import annotations
 
@@ -121,9 +121,9 @@ def main() -> None:
 
     cargo = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
     assert cargo["package"]["name"] == "ime-caret"
-    assert cargo["package"]["version"] == "2.4.0"
+    assert cargo["package"]["version"] == "2.5.0"
     assert 'name = "ime-caret"' in (ROOT / "Cargo.lock").read_text(encoding="utf-8")
-    assert 'version = "2.4.0"' in (ROOT / "Cargo.lock").read_text(encoding="utf-8")
+    assert 'version = "2.5.0"' in (ROOT / "Cargo.lock").read_text(encoding="utf-8")
     assert "active editable text caret" in cargo["package"]["description"]
 
     main_rs = (SRC / "main.rs").read_text(encoding="utf-8")
@@ -136,7 +136,7 @@ def main() -> None:
     all_source = "\n".join([main_rs, ime_rs, editability_rs, outlook_rs, config_rs, win_rs, assets_rs])
 
     assert 'const APP_NAME: &str = "IME Caret";' in main_rs
-    assert 'const APP_VERSION: &str = "2.4";' in main_rs
+    assert 'const APP_VERSION: &str = "2.5";' in main_rs
     assert "tray_tooltip_text()" in main_rs
     assert 'PathBuf::from("IME Caret.exe")' in main_rs
     assert 'exe_dir.join("IMECaret.ini")' in main_rs
@@ -301,8 +301,10 @@ def main() -> None:
     assert "RgbaColor::new(0x62, 0xff, 0x62, 0xa5)" in config_rs
     assert "RgbaColor::new(0x62, 0x62, 0xff, 0xa5)" in config_rs
     assert "excel_editor_window" in editability_rs
-    assert '"excel6" | "excel<" | "edtbx"' in editability_rs
-    assert 'normalized == "xlmain" || normalized.starts_with("bosa_sdm_xl")' in editability_rs
+    assert 'class_name.eq_ignore_ascii_case("EXCEL6")' in editability_rs
+    assert 'class_name.eq_ignore_ascii_case("EXCEL<")' in editability_rs
+    assert 'class_name.eq_ignore_ascii_case("XLMAIN") || is_excel_dialog_class(class_name)' in editability_rs
+    assert 'starts_with_ascii_case(class_name, "bosa_sdm_XL")' in editability_rs
     assert "excel_dialog_caret_anchor" in editability_rs
     assert "EnumChildWindows(" in editability_rs
     assert 'class_name.eq_ignore_ascii_case("EDTBX")' in editability_rs
@@ -469,7 +471,7 @@ def main() -> None:
             assert audio.getframerate() == 22050
             assert audio.getnframes() > 0
 
-    print("IME Caret 2.4 static checks passed")
+    print("IME Caret 2.5 static checks passed")
 
 
 if __name__ == "__main__":

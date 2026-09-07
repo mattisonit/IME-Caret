@@ -1,4 +1,4 @@
-# IME Caret 2.4
+# IME Caret 2.5
 
 Windows에서 현재 입력 가능한 텍스트 캐럿 옆에 IME 상태(한/영/일)를 작게 표시하는 Rust 프로그램입니다.
 
@@ -42,6 +42,10 @@ KoreanBackgroundColor=6262FFA5
 
 `IndicatorPosition`에는 `Right`, `Above`, `Below` 중 하나를 사용할 수 있습니다.
 Color값은 RRGGBBAA 형식입니다 (AA=00이면 완전 투명, AA=FF이면 완전 불투명).
+
+## 2.5 변경 사항
+
+- 빌드 시 사용자 설정 유지 및 콤보박스 편집 가능성 감지 강화. UIA 및 IME 쿼리 최적화, 메모리 할당 감소, 실패한 작업 표시줄 조회 제한.
 
 ## 2.4 변경 사항
 
